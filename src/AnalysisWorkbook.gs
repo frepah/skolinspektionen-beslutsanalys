@@ -447,10 +447,18 @@ function validateCostAndPrivacySettings_(settings, results) {
     ALLOW_EXTERNAL_AI: 'NEJ'
   };
   Object.keys(expectedLockedSettings).forEach(function(key) {
-    if (String(settings[key] || '').toUpperCase() !== expectedLockedSettings[key]) {
+    if (normalizeSettingValue_(settings[key]) !== expectedLockedSettings[key]) {
       results.push(validationResult_(ANALYSIS_SYSTEM.status.warning, 'Inställningar_Analys', 'Inställning avviker från beslutad kostnads- eller dataminimeringsstandard.', key));
     }
   });
+}
+
+
+function normalizeSettingValue_(value) {
+  if (value === null || typeof value === 'undefined') {
+    return '';
+  }
+  return String(value).trim().toUpperCase();
 }
 
 function readSettings_(sheet) {
