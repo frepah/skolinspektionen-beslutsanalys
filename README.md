@@ -4,7 +4,7 @@ Google Apps Script-grund för en analysdatabas som strukturerar Skolinspektionen
 
 ## Första etappen
 
-Den första etappen skapade en stabil grundstruktur för analysdelen, utan att ändra PDF-bevakaren:
+Den här etappen skapar en stabil grundstruktur för analysdelen, utan att ändra PDF-bevakaren:
 
 - `setupAnalysisWorkbook()` skapar saknade flikar, rubriker, standardinställningar och kodböcker utan att radera befintlig data.
 - `validateAnalysisWorkbook()` kontrollerar att obligatoriska flikar, rubriker och inställningar finns.
