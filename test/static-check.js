@@ -8,7 +8,10 @@ const requiredFunctions = [
   'setupAnalysisWorkbook',
   'validateAnalysisWorkbook',
   'onOpen',
-  'runAnalysisWorkbookSmokeTest'
+  'runAnalysisWorkbookSmokeTest',
+  'syncAnalysisQueueFromDriveFolders',
+  'showAddDriveFileToAnalysisQueuePrompt',
+  'addDriveFileToAnalysisQueue'
 ];
 
 for (const functionName of requiredFunctions) {
@@ -31,6 +34,31 @@ const forbiddenDefaults = [
 for (const forbidden of forbiddenDefaults) {
   if (source.includes(forbidden)) {
     throw new Error(`Forbidden default found: ${forbidden}`);
+  }
+}
+
+
+if (!source.includes('function normalizeSettingValue_')) {
+  throw new Error('Missing setting normalization helper.');
+}
+
+if (source.includes("String(settings[key] || '')")) {
+  throw new Error('Settings validation must not treat numeric zero as an empty value.');
+}
+
+
+const requiredSourceSnippets = [
+  'ANALYSIS_SOURCE_FOLDER_IDS',
+  'QUEUE_DEFAULT_ACTION',
+  'findOpenQueueRow_',
+  'manuellt_låst',
+  'DriveApp.getFolderById',
+  'DriveApp.getFileById'
+];
+
+for (const snippet of requiredSourceSnippets) {
+  if (!source.includes(snippet)) {
+    throw new Error(`Missing required source snippet: ${snippet}`);
   }
 }
 

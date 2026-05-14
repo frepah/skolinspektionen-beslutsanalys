@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: '0.1.0',
+  version: '0.2.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -37,7 +37,10 @@ const ANALYSIS_SETTINGS_DEFAULTS = Object.freeze({
   DASHBOARD_STALE_HOURS_WARNING: '24',
   ANALYSIS_MODEL_VERSION: '0.1.0',
   CODEBOOK_VERSION: '0.1.0',
-  DASHBOARD_VERSION: '0.1.0'
+  DASHBOARD_VERSION: '0.1.0',
+  ANALYSIS_SOURCE_FOLDER_IDS: '',
+  QUEUE_DEFAULT_ACTION: 'ANALYSERA_NY',
+  QUEUE_DEFAULT_PRIORITY: 'NORMAL'
 });
 
 const ANALYSIS_TABLES = Object.freeze({
@@ -258,7 +261,10 @@ const SETTING_DESCRIPTIONS = Object.freeze({
   DASHBOARD_STALE_HOURS_WARNING: 'Antal timmar innan DashboardData betraktas som gammalt.',
   ANALYSIS_MODEL_VERSION: 'Aktuell analysmodellversion.',
   CODEBOOK_VERSION: 'Aktuell kodboksversion.',
-  DASHBOARD_VERSION: 'Aktuell dashboardversion.'
+  DASHBOARD_VERSION: 'Aktuell dashboardversion.',
+  ANALYSIS_SOURCE_FOLDER_IDS: 'Kommaseparerade Google Drive-mapp-ID:n som ska synkas till analyskö. Lämnas tomt tills du aktivt väljer källmappar.',
+  QUEUE_DEFAULT_ACTION: 'Standardåtgärd när nya PDF:er läggs i analyskö.',
+  QUEUE_DEFAULT_PRIORITY: 'Standardprioritet när nya PDF:er läggs i analyskö.'
 });
 
 /** Skapar saknade flikar, rubriker, grundinställningar och kodböcker utan att radera befintlig data. */
@@ -333,7 +339,8 @@ function onOpen() {
     .addItem('2. Validera arbetsbok', 'validateAnalysisWorkbook')
     .addSeparator()
     .addItem('Kör grundtest', 'runAnalysisWorkbookSmokeTest')
-    .addItem('Synka analyskö (platshållare)', 'syncAnalysisQueuePlaceholder')
+    .addItem('Synka analyskö från Drive-mappar', 'syncAnalysisQueueFromDriveFolders')
+    .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData (platshållare)', 'updateDashboardDataPlaceholder')
     .addToUi();
 }
@@ -348,11 +355,259 @@ function runAnalysisWorkbookSmokeTest() {
 }
 
 function syncAnalysisQueuePlaceholder() {
-  logAnalysis_('INFO', 'syncAnalysisQueuePlaceholder', 'Platshållare körd. Analyskö-synk implementeras i senare etapp.', {});
+  return syncAnalysisQueueFromDriveFolders();
+}
+
+/**
+ * Synkar PDF-filer från Drive-mappar som anges i Inställningar_Analys/ANALYSIS_SOURCE_FOLDER_IDS.
+ * Funktionen registrerar dokumentmetadata och lägger dokument i Analyskö utan att ändra PDF-bevakaren.
+ */
+function syncAnalysisQueueFromDriveFolders() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  const folderIds = parseCommaSeparatedSetting_(settings.ANALYSIS_SOURCE_FOLDER_IDS);
+  const batchSize = getPositiveIntegerSetting_(settings.DEFAULT_BATCH_SIZE, 10);
+  const summary = { folders: folderIds.length, scanned: 0, registered: 0, queued: 0, skipped: 0, errors: 0 };
+
+  if (folderIds.length === 0) {
+    logAnalysis_('WARNING', 'syncAnalysisQueueFromDriveFolders', 'Ingen Drive-mapp är angiven i ANALYSIS_SOURCE_FOLDER_IDS.', summary);
+    return summary;
+  }
+
+  folderIds.forEach(function(folderId) {
+    try {
+      const folder = DriveApp.getFolderById(folderId);
+      const files = folder.getFilesByType(MimeType.PDF);
+      while (files.hasNext() && summary.scanned < batchSize) {
+        const file = files.next();
+        summary.scanned += 1;
+        const result = registerDriveFileForAnalysis_(spreadsheet, file, 'DRIVE_FOLDER_SYNC', {
+          action: settings.QUEUE_DEFAULT_ACTION || 'ANALYSERA_NY',
+          priority: settings.QUEUE_DEFAULT_PRIORITY || 'NORMAL'
+        });
+        summary.registered += result.documentRegistered ? 1 : 0;
+        summary.queued += result.queueCreated ? 1 : 0;
+        summary.skipped += result.skipped ? 1 : 0;
+      }
+    } catch (error) {
+      summary.errors += 1;
+      logError_('syncAnalysisQueueFromDriveFolders', error, 'DriveFolder', folderId);
+    }
+  });
+
+  logAnalysis_('INFO', 'syncAnalysisQueueFromDriveFolders', 'Synk av analyskö slutförd.', summary);
+  return summary;
+}
+
+/** Visar en enkel dialog så att en novis kan lägga till en PDF via Drive-fil-ID eller URL. */
+function showAddDriveFileToAnalysisQueuePrompt() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt('Lägg till PDF', 'Klistra in Google Drive-fil-ID eller fil-URL för PDF:en.', ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+  const result = addDriveFileToAnalysisQueue(response.getResponseText());
+  ui.alert('Klar', 'Dokument registrerat: ' + result.documentRegistered + '\nKöpost skapad: ' + result.queueCreated, ui.ButtonSet.OK);
+}
+
+/** Registrerar en enskild Drive-PDF och lägger den i Analyskö. */
+function addDriveFileToAnalysisQueue(fileIdOrUrl) {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const fileId = extractDriveFileId_(fileIdOrUrl);
+  const file = DriveApp.getFileById(fileId);
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  const result = registerDriveFileForAnalysis_(spreadsheet, file, 'MANUAL_FILE_ADD', {
+    action: settings.QUEUE_DEFAULT_ACTION || 'ANALYSERA_NY',
+    priority: settings.QUEUE_DEFAULT_PRIORITY || 'NORMAL'
+  });
+  logAnalysis_('INFO', 'addDriveFileToAnalysisQueue', 'En Drive-fil har registrerats för analys.', result);
+  return result;
 }
 
 function updateDashboardDataPlaceholder() {
   logAnalysis_('INFO', 'updateDashboardDataPlaceholder', 'Platshållare körd. DashboardData-byggare implementeras i senare etapp.', {});
+}
+
+function registerDriveFileForAnalysis_(spreadsheet, file, source, options) {
+  const queueOptions = options || {};
+  const action = String(queueOptions.action || 'ANALYSERA_NY');
+  const priority = String(queueOptions.priority || 'NORMAL');
+  if (file.getMimeType() !== MimeType.PDF) {
+    logAnalysis_('WARNING', 'registerDriveFileForAnalysis_', 'Filen är inte en PDF och hoppades över.', {
+      driveFileId: file.getId(),
+      mimeType: file.getMimeType(),
+      source: source
+    });
+    return { driveFileId: file.getId(), documentRegistered: false, queueCreated: false, skipped: true };
+  }
+
+  const documentResult = upsertDocumentFromDriveFile_(spreadsheet, file, source);
+  const queueResult = enqueueDocumentForAnalysis_(spreadsheet, file.getId(), documentResult.caseId || '', action, priority);
+  return {
+    driveFileId: file.getId(),
+    documentRegistered: documentResult.created || documentResult.updated,
+    queueCreated: queueResult.created,
+    skipped: documentResult.skipped || queueResult.skipped,
+    caseId: documentResult.caseId || '',
+    source: source
+  };
+}
+
+function upsertDocumentFromDriveFile_(spreadsheet, file, source) {
+  const sheet = spreadsheet.getSheetByName('Dokument');
+  const headerMap = getHeaderMap_(sheet);
+  const driveFileId = file.getId();
+  const existingRow = findRowByKey_(sheet, 'drive_file_id', driveFileId);
+  const now = new Date();
+  const values = {
+    'drive_file_id': driveFileId,
+    'filnamn': file.getName(),
+    'drive_url': file.getUrl(),
+    'analysis_status': 'KÖAD',
+    'analysis_model_version': ANALYSIS_SETTINGS_DEFAULTS.ANALYSIS_MODEL_VERSION,
+    'codebook_version': ANALYSIS_SETTINGS_DEFAULTS.CODEBOOK_VERSION,
+    'confidence': 'OKÄND',
+    'manuell_granskning': 'NEJ',
+    'uppdaterad_tid': now
+  };
+
+  if (!existingRow) {
+    values['text_extraction_status'] = 'EJ_STARTAD';
+    values['text_length'] = 0;
+    values['manuellt_låst'] = 'NEJ';
+    values['skapad_tid'] = now;
+    appendRows_(sheet, [buildRow_(headerMap, values)]);
+    return { created: true, updated: false, skipped: false, caseId: '' };
+  }
+
+  if (isRowManuallyLocked_(sheet, existingRow, headerMap)) {
+    logAnalysis_('INFO', 'upsertDocumentFromDriveFile_', 'Dokumentraden är manuellt låst och uppdaterades inte.', {
+      driveFileId: driveFileId,
+      row: existingRow,
+      source: source
+    });
+    return { created: false, updated: false, skipped: true, caseId: getCellValueByHeader_(sheet, existingRow, headerMap, 'case_id') };
+  }
+
+  setRowValues_(sheet, existingRow, headerMap, values);
+  return { created: false, updated: true, skipped: false, caseId: getCellValueByHeader_(sheet, existingRow, headerMap, 'case_id') };
+}
+
+function enqueueDocumentForAnalysis_(spreadsheet, driveFileId, caseId, action, priority) {
+  const sheet = spreadsheet.getSheetByName('Analyskö');
+  const headerMap = getHeaderMap_(sheet);
+  const existingRow = findOpenQueueRow_(sheet, driveFileId, action);
+  const now = new Date();
+
+  if (existingRow) {
+    setRowValues_(sheet, existingRow, headerMap, { 'uppdaterad_tid': now });
+    return { created: false, skipped: true, row: existingRow };
+  }
+
+  appendRows_(sheet, [buildRow_(headerMap, {
+    'queue_id': Utilities.getUuid(),
+    'drive_file_id': driveFileId,
+    'case_id': caseId || '',
+    'åtgärd': action,
+    'prioritet': priority,
+    'status': 'KÖAD',
+    'försök': 0,
+    'senaste_fel': '',
+    'skapad_tid': now,
+    'uppdaterad_tid': now,
+    'klar_tid': ''
+  })]);
+  return { created: true, skipped: false, row: sheet.getLastRow() };
+}
+
+function findOpenQueueRow_(sheet, driveFileId, action) {
+  const headerMap = getHeaderMap_(sheet);
+  if (!headerMap.drive_file_id || !headerMap['åtgärd'] || !headerMap.status || sheet.getLastRow() < 2) {
+    return 0;
+  }
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let index = 0; index < values.length; index += 1) {
+    const row = values[index];
+    const sameFile = String(row[headerMap.drive_file_id - 1] || '') === driveFileId;
+    const sameAction = String(row[headerMap['åtgärd'] - 1] || '') === action;
+    const status = String(row[headerMap.status - 1] || '').toUpperCase();
+    if (sameFile && sameAction && status !== 'KLAR' && status !== 'AVBRUTEN') {
+      return index + 2;
+    }
+  }
+  return 0;
+}
+
+function findRowByKey_(sheet, headerName, key) {
+  const headerMap = getHeaderMap_(sheet);
+  const keyColumn = headerMap[headerName];
+  if (!keyColumn || sheet.getLastRow() < 2) {
+    return 0;
+  }
+  const values = sheet.getRange(2, keyColumn, sheet.getLastRow() - 1, 1).getValues();
+  for (let index = 0; index < values.length; index += 1) {
+    if (String(values[index][0] || '') === String(key)) {
+      return index + 2;
+    }
+  }
+  return 0;
+}
+
+function setRowValues_(sheet, rowNumber, headerMap, valuesByHeader) {
+  const rowRange = sheet.getRange(rowNumber, 1, 1, sheet.getLastColumn());
+  const row = rowRange.getValues()[0];
+  Object.keys(valuesByHeader).forEach(function(header) {
+    if (headerMap[header]) {
+      row[headerMap[header] - 1] = valuesByHeader[header];
+    }
+  });
+  rowRange.setValues([row]);
+}
+
+function getCellValueByHeader_(sheet, rowNumber, headerMap, headerName) {
+  if (!headerMap[headerName]) {
+    return '';
+  }
+  return sheet.getRange(rowNumber, headerMap[headerName]).getValue();
+}
+
+function isRowManuallyLocked_(sheet, rowNumber, headerMap) {
+  return normalizeSettingValue_(getCellValueByHeader_(sheet, rowNumber, headerMap, ANALYSIS_SYSTEM.manualLockHeader)) === 'JA';
+}
+
+function extractDriveFileId_(fileIdOrUrl) {
+  const raw = String(fileIdOrUrl || '').trim();
+  if (!raw) {
+    throw new Error('Drive-fil-ID eller URL saknas.');
+  }
+  const directFileMatch = raw.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (directFileMatch) {
+    return directFileMatch[1];
+  }
+  const queryIdMatch = raw.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (queryIdMatch) {
+    return queryIdMatch[1];
+  }
+  const folderStyleMatch = raw.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+  if (folderStyleMatch) {
+    return folderStyleMatch[1];
+  }
+  return raw;
+}
+
+function parseCommaSeparatedSetting_(value) {
+  return String(value || '')
+    .split(',')
+    .map(function(item) { return item.trim(); })
+    .filter(function(item) { return item !== ''; });
+}
+
+function getPositiveIntegerSetting_(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return fallback;
+  }
+  return Math.floor(parsed);
 }
 
 function getActiveAnalysisSpreadsheet_() {
