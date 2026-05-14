@@ -2344,3 +2344,5 @@ Sammanfatta efter implementationen:
 7. rekommenderat nästa steg.
 
 SLUT CODEX-PROMPT ETAPP 1
+
+Add AGENTS instructions
