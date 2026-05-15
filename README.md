@@ -52,7 +52,7 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 ## Kom igång med etapp 2–4
 
 1. Uppdatera Apps Script-filen `AnalysisWorkbook.gs` med repo-versionen.
-2. Uppdatera `appsscript.json` och aktivera avancerade Google-tjänsten Drive API om du ska köra PDF-textkomplettering.
+2. Uppdatera `appsscript.json` och aktivera avancerade Google-tjänsten Drive API v3 om du ska köra PDF-textkomplettering. Lägg inte till Drive API två gånger; finns Drive redan under Tjänster ska du inte klicka Lägg till igen.
 3. Kör `setupAnalysisWorkbook()` igen så att nya inställningar läggs till utan att befintlig data raderas.
 4. Fyll i `ANALYSIS_SOURCE_FOLDER_IDS` i fliken `Inställningar_Analys` med en eller flera Drive-mapp-ID:n, separerade med kommatecken.
 5. Kör **Analys → Synka analyskö från Drive-mappar**.

@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: '0.4.0',
+  version: '0.4.1',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -823,12 +823,8 @@ function extractTemporaryTextFromPdf_(driveFileId, ocrLanguage) {
   const tempName = 'TEMP_TEXT_' + driveFileId + '_' + new Date().getTime();
   let tempFileId = '';
   try {
-    const inserted = Drive.Files.insert(
-      { title: tempName, mimeType: MimeType.GOOGLE_DOCS },
-      sourceFile.getBlob(),
-      { convert: true, ocr: true, ocrLanguage: ocrLanguage || 'sv' }
-    );
-    tempFileId = inserted.id;
+    const created = createTemporaryGoogleDocFromPdf_(sourceFile, tempName, ocrLanguage || 'sv');
+    tempFileId = created.id;
     const text = DocumentApp.openById(tempFileId).getBody().getText() || '';
     return { method: 'GOOGLE_DOCS_OCR_TEMP', status: 'TEMP_EXTRACTED_DELETED', text: text, textLength: text.length };
   } finally {
@@ -836,6 +832,22 @@ function extractTemporaryTextFromPdf_(driveFileId, ocrLanguage) {
       DriveApp.getFileById(tempFileId).setTrashed(true);
     }
   }
+}
+
+function createTemporaryGoogleDocFromPdf_(sourceFile, tempName, ocrLanguage) {
+  const blob = sourceFile.getBlob();
+  if (Drive.Files.create) {
+    return Drive.Files.create(
+      { name: tempName, mimeType: MimeType.GOOGLE_DOCS },
+      blob,
+      { ocrLanguage: ocrLanguage, supportsAllDrives: true }
+    );
+  }
+  return Drive.Files.insert(
+    { title: tempName, mimeType: MimeType.GOOGLE_DOCS },
+    blob,
+    { convert: true, ocr: true, ocrLanguage: ocrLanguage }
+  );
 }
 
 function extractDocumentMetadataFromText_(text, fallbackFileName) {
@@ -880,7 +892,7 @@ function mergeMetadata_(primary, secondary, existing) {
 }
 
 function assertDriveAdvancedServiceEnabled_() {
-  if (typeof Drive === 'undefined' || !Drive.Files || !Drive.Files.insert) {
+  if (typeof Drive === 'undefined' || !Drive.Files || (!Drive.Files.create && !Drive.Files.insert)) {
     throw new Error('Aktivera avancerade Google-tjänsten Drive API i Apps Script innan PDF-textutvinning körs.');
   }
 }
