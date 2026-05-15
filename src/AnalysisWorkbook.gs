@@ -367,7 +367,7 @@ function syncAnalysisQueueFromDriveFolders() {
   const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
   const folderIds = parseCommaSeparatedSetting_(settings.ANALYSIS_SOURCE_FOLDER_IDS);
   const batchSize = getPositiveIntegerSetting_(settings.DEFAULT_BATCH_SIZE, 10);
-  const summary = { folders: folderIds.length, scanned: 0, registered: 0, queued: 0, skipped: 0, errors: 0 };
+  const summary = { folders: folderIds.length, scanned: 0, registered: 0, queued: 0, alreadyRegistered: 0, skipped: 0, errors: 0 };
 
   if (folderIds.length === 0) {
     logAnalysis_('WARNING', 'syncAnalysisQueueFromDriveFolders', 'Ingen Drive-mapp är angiven i ANALYSIS_SOURCE_FOLDER_IDS.', summary);
@@ -378,9 +378,14 @@ function syncAnalysisQueueFromDriveFolders() {
     try {
       const folder = DriveApp.getFolderById(folderId);
       const files = folder.getFilesByType(MimeType.PDF);
-      while (files.hasNext() && summary.scanned < batchSize) {
+      while (files.hasNext() && summary.registered < batchSize) {
         const file = files.next();
         summary.scanned += 1;
+        if (isDocumentRegistered_(spreadsheet, file.getId())) {
+          summary.alreadyRegistered += 1;
+          summary.skipped += 1;
+          continue;
+        }
         const result = registerDriveFileForAnalysis_(spreadsheet, file, 'DRIVE_FOLDER_SYNC', {
           action: settings.QUEUE_DEFAULT_ACTION || 'ANALYSERA_NY',
           priority: settings.QUEUE_DEFAULT_PRIORITY || 'NORMAL'
@@ -426,6 +431,12 @@ function addDriveFileToAnalysisQueue(fileIdOrUrl) {
 
 function updateDashboardDataPlaceholder() {
   logAnalysis_('INFO', 'updateDashboardDataPlaceholder', 'Platshållare körd. DashboardData-byggare implementeras i senare etapp.', {});
+}
+
+
+function isDocumentRegistered_(spreadsheet, driveFileId) {
+  const sheet = spreadsheet.getSheetByName('Dokument');
+  return Boolean(sheet && findRowByKey_(sheet, 'drive_file_id', driveFileId));
 }
 
 function registerDriveFileForAnalysis_(spreadsheet, file, source, options) {

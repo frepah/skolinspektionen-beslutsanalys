@@ -51,6 +51,8 @@ const requiredSourceSnippets = [
   'ANALYSIS_SOURCE_FOLDER_IDS',
   'QUEUE_DEFAULT_ACTION',
   'findOpenQueueRow_',
+  'isDocumentRegistered_',
+  'alreadyRegistered',
   'manuellt_låst',
   'DriveApp.getFolderById',
   'DriveApp.getFileById'
