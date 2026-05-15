@@ -22,13 +22,23 @@ Den andra etappen börjar använda grundstrukturen genom att lägga till kö- oc
 - Dokument läggs idempotent i `Analyskö`; befintliga öppna köposter återanvänds i stället för att skapa dubbletter.
 - Manuellt låsta dokumentrader (`manuellt_låst = JA`) skrivs inte över automatiskt.
 
+## Tredje etappen
+
+Den tredje etappen bearbetar köade dokument med första regelbaserade metadataextraktion, fortfarande utan AI-kostnad och utan permanent fulltextlagring:
+
+- `processAnalysisQueueBatch()` hämtar köposter med status `KÖAD` från `Analyskö`.
+- Filnamn används för första försök att hitta diarienummer, beslutsdatum och dokumenttyp.
+- `Dokument` uppdateras med `case_id`, `dnr_raw`, `dnr_normaliserad`, `beslutsdatum`, `dokumenttyp`, `analysis_status` och `confidence`.
+- `Ärenden` och `ÄrendeDokument` skapas/uppdateras idempotent så att dokument kan räknas på ärendenivå.
+- Saknat diarienummer eller beslutsdatum skapar poster i `Manuell_granskning` i stället för att gissa.
+
 ## Beslutade standarder
 
 Standardinställningarna följer kravspecifikationens prioritering: ingen kostnad, dataminimering, robusthet, dubblettskydd, manuell granskning och spårbarhet.
 
 Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI-/externa tjänster är avstängda i standardläge.
 
-## Kom igång med etapp 2
+## Kom igång med etapp 2–3
 
 1. Uppdatera Apps Script-filen `AnalysisWorkbook.gs` med repo-versionen.
 2. Kör `setupAnalysisWorkbook()` igen så att nya inställningar läggs till utan att befintlig data raderas.
@@ -36,3 +46,5 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 4. Kör **Analys → Synka analyskö från Drive-mappar**.
 5. Kontrollera flikarna `Dokument`, `Analyskö`, `Analyslogg` och `Fellogg`.
 6. Kör samma menyval igen om mapparna innehåller fler PDF:er än `DEFAULT_BATCH_SIZE`; redan registrerade dokument hoppas över och nästa batch fylls på.
+7. Kör **Analys → Bearbeta analyskö (metadata)** för att skapa första ärende- och dokumentkopplingarna.
+8. Kontrollera flikarna `Ärenden`, `ÄrendeDokument`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.

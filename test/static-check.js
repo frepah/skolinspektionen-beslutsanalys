@@ -11,7 +11,10 @@ const requiredFunctions = [
   'runAnalysisWorkbookSmokeTest',
   'syncAnalysisQueueFromDriveFolders',
   'showAddDriveFileToAnalysisQueuePrompt',
-  'addDriveFileToAnalysisQueue'
+  'addDriveFileToAnalysisQueue',
+  'processAnalysisQueueBatch',
+  'processQueuedDocument_',
+  'extractDocumentMetadataFromFileName_'
 ];
 
 for (const functionName of requiredFunctions) {
@@ -55,7 +58,11 @@ const requiredSourceSnippets = [
   'alreadyRegistered',
   'manuellt_låst',
   'DriveApp.getFolderById',
-  'DriveApp.getFileById'
+  'DriveApp.getFileById',
+  'METADATA_REGISTRERAD',
+  'SAKNAT_DIARIENUMMER',
+  'ÄrendeDokument',
+  'rowToObject_'
 ];
 
 for (const snippet of requiredSourceSnippets) {

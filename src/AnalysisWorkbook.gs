@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: '0.2.0',
+  version: '0.3.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -340,6 +340,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Kör grundtest', 'runAnalysisWorkbookSmokeTest')
     .addItem('Synka analyskö från Drive-mappar', 'syncAnalysisQueueFromDriveFolders')
+    .addItem('Bearbeta analyskö (metadata)', 'processAnalysisQueueBatch')
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData (platshållare)', 'updateDashboardDataPlaceholder')
     .addToUi();
@@ -427,6 +428,270 @@ function addDriveFileToAnalysisQueue(fileIdOrUrl) {
   });
   logAnalysis_('INFO', 'addDriveFileToAnalysisQueue', 'En Drive-fil har registrerats för analys.', result);
   return result;
+}
+
+/** Bearbetar köade dokument med regelbaserad metadataextraktion utan AI och utan fulltextlagring. */
+function processAnalysisQueueBatch() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  const batchSize = getPositiveIntegerSetting_(settings.DEFAULT_BATCH_SIZE, 10);
+  const queueSheet = spreadsheet.getSheetByName('Analyskö');
+  const queueHeaderMap = getHeaderMap_(queueSheet);
+  const queueRows = getQueuedRows_(queueSheet, queueHeaderMap, batchSize);
+  const summary = { selected: queueRows.length, processed: 0, errors: 0, manualReview: 0 };
+
+  queueRows.forEach(function(queueItem) {
+    try {
+      setRowValues_(queueSheet, queueItem.rowNumber, queueHeaderMap, {
+        'status': 'BEARBETAS',
+        'försök': Number(queueItem.values['försök'] || 0) + 1,
+        'uppdaterad_tid': new Date()
+      });
+      const result = processQueuedDocument_(spreadsheet, queueItem.values);
+      setRowValues_(queueSheet, queueItem.rowNumber, queueHeaderMap, {
+        'case_id': result.caseId || queueItem.values.case_id || '',
+        'status': 'KLAR',
+        'senaste_fel': '',
+        'uppdaterad_tid': new Date(),
+        'klar_tid': new Date()
+      });
+      summary.processed += 1;
+      summary.manualReview += result.manualReviewCount || 0;
+    } catch (error) {
+      summary.errors += 1;
+      setRowValues_(queueSheet, queueItem.rowNumber, queueHeaderMap, {
+        'status': 'FEL',
+        'senaste_fel': error.message || String(error),
+        'uppdaterad_tid': new Date()
+      });
+      logError_('processAnalysisQueueBatch', error, 'Analyskö', queueItem.values.queue_id || queueItem.values.drive_file_id || '');
+    }
+  });
+
+  logAnalysis_('INFO', 'processAnalysisQueueBatch', 'Bearbetning av analyskö slutförd.', summary);
+  return summary;
+}
+
+function getQueuedRows_(sheet, headerMap, limit) {
+  const rows = [];
+  if (sheet.getLastRow() < 2) {
+    return rows;
+  }
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let index = 0; index < values.length && rows.length < limit; index += 1) {
+    const rowNumber = index + 2;
+    const rowObject = rowToObject_(values[index], headerMap);
+    const status = normalizeSettingValue_(rowObject.status || '');
+    if (status === 'KÖAD') {
+      rows.push({ rowNumber: rowNumber, values: rowObject });
+    }
+  }
+  return rows;
+}
+
+function processQueuedDocument_(spreadsheet, queueValues) {
+  const driveFileId = queueValues.drive_file_id;
+  if (!driveFileId) {
+    throw new Error('Köpost saknar drive_file_id.');
+  }
+
+  const documentSheet = spreadsheet.getSheetByName('Dokument');
+  const documentHeaderMap = getHeaderMap_(documentSheet);
+  const documentRow = findRowByKey_(documentSheet, 'drive_file_id', driveFileId);
+  if (!documentRow) {
+    throw new Error('Dokument saknas för drive_file_id: ' + driveFileId);
+  }
+
+  const documentValues = rowToObject_(documentSheet.getRange(documentRow, 1, 1, documentSheet.getLastColumn()).getValues()[0], documentHeaderMap);
+  const metadata = extractDocumentMetadataFromFileName_(documentValues.filnamn || '');
+  const caseId = metadata.dnrNormaliserad ? buildCaseIdFromDnr_(metadata.dnrNormaliserad) : buildTemporaryCaseId_(driveFileId);
+  const confidence = metadata.dnrNormaliserad ? 'MEDEL' : 'LÅG';
+  const manualReviewNeeded = !metadata.dnrNormaliserad || !metadata.beslutsdatum;
+  let manualReviewCount = 0;
+
+  if (!isRowManuallyLocked_(documentSheet, documentRow, documentHeaderMap)) {
+    setRowValues_(documentSheet, documentRow, documentHeaderMap, {
+      'dnr_raw': metadata.dnrRaw || documentValues.dnr_raw || '',
+      'dnr_normaliserad': metadata.dnrNormaliserad || documentValues.dnr_normaliserad || '',
+      'case_id': caseId,
+      'beslutsdatum': metadata.beslutsdatum || documentValues.beslutsdatum || '',
+      'dokumenttyp': metadata.dokumenttyp,
+      'analysis_status': 'METADATA_REGISTRERAD',
+      'confidence': confidence,
+      'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+      'uppdaterad_tid': new Date()
+    });
+  }
+
+  upsertCaseFromDocumentMetadata_(spreadsheet, caseId, metadata, confidence, manualReviewNeeded);
+  upsertCaseDocumentLink_(spreadsheet, caseId, driveFileId, metadata, confidence, manualReviewNeeded);
+
+  if (!metadata.dnrNormaliserad) {
+    addManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'dnr_normaliserad', '', 'SAKNAT_DIARIENUMMER', 'Diarienummer kunde inte identifieras regelbaserat från filnamnet.', 'LÅG');
+    manualReviewCount += 1;
+  }
+  if (!metadata.beslutsdatum) {
+    addManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'beslutsdatum', '', 'SAKNAT_BESLUTSDATUM', 'Beslutsdatum kunde inte identifieras regelbaserat från filnamnet.', 'LÅG');
+    manualReviewCount += 1;
+  }
+
+  return { caseId: caseId, manualReviewCount: manualReviewCount };
+}
+
+function extractDocumentMetadataFromFileName_(fileName) {
+  const normalizedName = String(fileName || '').replace(/\.pdf$/i, '');
+  const dnrMatch = normalizedName.match(/(?:dnr|diarienr|diarienummer)\s*[:.]?\s*([0-9]{4}[:_\/-][0-9]{1,6}|[0-9]{1,6}[:_\/-][0-9]{4})/i) ||
+    normalizedName.match(/\b([0-9]{4}[:\/][0-9]{1,6}|[0-9]{1,6}[:\/][0-9]{4})\b/);
+  const dateMatch = normalizedName.match(/(20[0-9]{2})[-_. ]?([01][0-9])[-_. ]?([0-3][0-9])/);
+  return {
+    dnrRaw: dnrMatch ? dnrMatch[1] : '',
+    dnrNormaliserad: dnrMatch ? normalizeDnr_(dnrMatch[1]) : '',
+    beslutsdatum: dateMatch ? dateMatch[1] + '-' + dateMatch[2] + '-' + dateMatch[3] : '',
+    dokumenttyp: inferDocumentType_(normalizedName)
+  };
+}
+
+function normalizeDnr_(dnrRaw) {
+  return String(dnrRaw || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/[\/_-]/g, ':');
+}
+
+function inferDocumentType_(fileName) {
+  const upperName = String(fileName || '').toUpperCase();
+  if (upperName.indexOf('UPPFÖLJ') !== -1) {
+    return 'UPPFÖLJNINGSBESLUT';
+  }
+  if (upperName.indexOf('AVSLUT') !== -1) {
+    return 'AVSLUTANDE_BESLUT';
+  }
+  if (upperName.indexOf('BESLUT') !== -1) {
+    return 'GRUNDBESLUT';
+  }
+  return 'OKÄND';
+}
+
+function buildCaseIdFromDnr_(dnrNormaliserad) {
+  return 'DNR_' + String(dnrNormaliserad || '').replace(/[^A-Za-z0-9]/g, '_');
+}
+
+function buildTemporaryCaseId_(driveFileId) {
+  return 'TEMP_' + String(driveFileId || '').replace(/[^A-Za-z0-9]/g, '_');
+}
+
+function upsertCaseFromDocumentMetadata_(spreadsheet, caseId, metadata, confidence, manualReviewNeeded) {
+  const sheet = spreadsheet.getSheetByName('Ärenden');
+  const headerMap = getHeaderMap_(sheet);
+  const existingRow = findRowByKey_(sheet, 'case_id', caseId);
+  const values = {
+    'case_id': caseId,
+    'dnr_raw': metadata.dnrRaw || '',
+    'dnr_normaliserad': metadata.dnrNormaliserad || '',
+    'ärendetyp': metadata.dokumenttyp || 'OKÄND',
+    'beslutsdatum_första': metadata.beslutsdatum || '',
+    'beslutsdatum_senaste': metadata.beslutsdatum || '',
+    'confidence': confidence,
+    'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+    'manuellt_låst': 'NEJ',
+    'uppdaterad_tid': new Date()
+  };
+
+  if (!existingRow) {
+    values['skapad_tid'] = new Date();
+    appendRows_(sheet, [buildRow_(headerMap, values)]);
+    return;
+  }
+
+  if (!isRowManuallyLocked_(sheet, existingRow, headerMap)) {
+    setRowValues_(sheet, existingRow, headerMap, values);
+  }
+}
+
+function upsertCaseDocumentLink_(spreadsheet, caseId, driveFileId, metadata, confidence, manualReviewNeeded) {
+  const sheet = spreadsheet.getSheetByName('ÄrendeDokument');
+  const headerMap = getHeaderMap_(sheet);
+  const existingRow = findCaseDocumentRow_(sheet, caseId, driveFileId);
+  const values = {
+    'case_id': caseId,
+    'drive_file_id': driveFileId,
+    'dokumentroll': metadata.dokumenttyp || 'OKÄND',
+    'dnr_normaliserad': metadata.dnrNormaliserad || '',
+    'beslutsdatum': metadata.beslutsdatum || '',
+    'confidence': confidence,
+    'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+    'manuellt_låst': 'NEJ',
+    'uppdaterad_tid': new Date()
+  };
+
+  if (!existingRow) {
+    values['skapad_tid'] = new Date();
+    appendRows_(sheet, [buildRow_(headerMap, values)]);
+    return;
+  }
+
+  if (!isRowManuallyLocked_(sheet, existingRow, headerMap)) {
+    setRowValues_(sheet, existingRow, headerMap, values);
+  }
+}
+
+function findCaseDocumentRow_(sheet, caseId, driveFileId) {
+  const headerMap = getHeaderMap_(sheet);
+  if (!headerMap.case_id || !headerMap.drive_file_id || sheet.getLastRow() < 2) {
+    return 0;
+  }
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let index = 0; index < values.length; index += 1) {
+    if (String(values[index][headerMap.case_id - 1] || '') === String(caseId) &&
+        String(values[index][headerMap.drive_file_id - 1] || '') === String(driveFileId)) {
+      return index + 2;
+    }
+  }
+  return 0;
+}
+
+function addManualReviewItem_(spreadsheet, sourceTable, sourceKey, fieldName, suggestedValue, problemType, description, confidence) {
+  const sheet = spreadsheet.getSheetByName('Manuell_granskning');
+  const headerMap = getHeaderMap_(sheet);
+  const existingRow = findManualReviewRow_(sheet, sourceTable, sourceKey, fieldName, problemType);
+  const values = {
+    'review_id': existingRow ? getCellValueByHeader_(sheet, existingRow, headerMap, 'review_id') : Utilities.getUuid(),
+    'källa_tabell': sourceTable,
+    'källa_nyckel': sourceKey,
+    'fält': fieldName,
+    'föreslaget_värde': suggestedValue,
+    'problemtyp': problemType,
+    'beskrivning': description,
+    'confidence': confidence,
+    'status': 'ÖPPEN',
+    'uppdaterad_tid': new Date()
+  };
+
+  if (!existingRow) {
+    values['skapad_tid'] = new Date();
+    appendRows_(sheet, [buildRow_(headerMap, values)]);
+    return;
+  }
+
+  setRowValues_(sheet, existingRow, headerMap, values);
+}
+
+function findManualReviewRow_(sheet, sourceTable, sourceKey, fieldName, problemType) {
+  const headerMap = getHeaderMap_(sheet);
+  if (!headerMap['källa_tabell'] || !headerMap['källa_nyckel'] || !headerMap['fält'] || !headerMap.problemtyp || sheet.getLastRow() < 2) {
+    return 0;
+  }
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let index = 0; index < values.length; index += 1) {
+    const row = values[index];
+    if (String(row[headerMap['källa_tabell'] - 1] || '') === String(sourceTable) &&
+        String(row[headerMap['källa_nyckel'] - 1] || '') === String(sourceKey) &&
+        String(row[headerMap['fält'] - 1] || '') === String(fieldName) &&
+        String(row[headerMap.problemtyp - 1] || '') === String(problemType)) {
+      return index + 2;
+    }
+  }
+  return 0;
 }
 
 function updateDashboardDataPlaceholder() {
@@ -529,6 +794,13 @@ function enqueueDocumentForAnalysis_(spreadsheet, driveFileId, caseId, action, p
     'klar_tid': ''
   })]);
   return { created: true, skipped: false, row: sheet.getLastRow() };
+}
+
+function rowToObject_(row, headerMap) {
+  return Object.keys(headerMap).reduce(function(object, header) {
+    object[header] = row[headerMap[header] - 1];
+    return object;
+  }, {});
 }
 
 function findOpenQueueRow_(sheet, driveFileId, action) {
