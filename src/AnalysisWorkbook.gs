@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: '0.3.0',
+  version: '0.4.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -40,7 +40,9 @@ const ANALYSIS_SETTINGS_DEFAULTS = Object.freeze({
   DASHBOARD_VERSION: '0.1.0',
   ANALYSIS_SOURCE_FOLDER_IDS: '',
   QUEUE_DEFAULT_ACTION: 'ANALYSERA_NY',
-  QUEUE_DEFAULT_PRIORITY: 'NORMAL'
+  QUEUE_DEFAULT_PRIORITY: 'NORMAL',
+  TEXT_EXTRACTION_BATCH_SIZE: '5',
+  TEXT_EXTRACTION_OCR_LANGUAGE: 'sv'
 });
 
 const ANALYSIS_TABLES = Object.freeze({
@@ -264,7 +266,9 @@ const SETTING_DESCRIPTIONS = Object.freeze({
   DASHBOARD_VERSION: 'Aktuell dashboardversion.',
   ANALYSIS_SOURCE_FOLDER_IDS: 'Kommaseparerade Google Drive-mapp-ID:n som ska synkas till analyskö. Lämnas tomt tills du aktivt väljer källmappar.',
   QUEUE_DEFAULT_ACTION: 'Standardåtgärd när nya PDF:er läggs i analyskö.',
-  QUEUE_DEFAULT_PRIORITY: 'Standardprioritet när nya PDF:er läggs i analyskö.'
+  QUEUE_DEFAULT_PRIORITY: 'Standardprioritet när nya PDF:er läggs i analyskö.',
+  TEXT_EXTRACTION_BATCH_SIZE: 'Batchstorlek för tillfällig PDF-textutvinning. Hålls lägre än analysköbatch eftersom PDF-konvertering är långsammare.',
+  TEXT_EXTRACTION_OCR_LANGUAGE: 'OCR-språk vid tillfällig Google Docs-konvertering av PDF.'
 });
 
 /** Skapar saknade flikar, rubriker, grundinställningar och kodböcker utan att radera befintlig data. */
@@ -341,6 +345,7 @@ function onOpen() {
     .addItem('Kör grundtest', 'runAnalysisWorkbookSmokeTest')
     .addItem('Synka analyskö från Drive-mappar', 'syncAnalysisQueueFromDriveFolders')
     .addItem('Bearbeta analyskö (metadata)', 'processAnalysisQueueBatch')
+    .addItem('Komplettera metadata från PDF-text', 'enrichMetadataFromPdfTextBatch')
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData (platshållare)', 'updateDashboardDataPlaceholder')
     .addToUi();
@@ -692,6 +697,210 @@ function findManualReviewRow_(sheet, sourceTable, sourceKey, fieldName, problemT
     }
   }
   return 0;
+}
+
+function closeManualReviewItem_(spreadsheet, sourceTable, sourceKey, fieldName, problemType) {
+  const sheet = spreadsheet.getSheetByName('Manuell_granskning');
+  const headerMap = getHeaderMap_(sheet);
+  const existingRow = findManualReviewRow_(sheet, sourceTable, sourceKey, fieldName, problemType);
+  if (!existingRow) {
+    return;
+  }
+  setRowValues_(sheet, existingRow, headerMap, {
+    'status': 'ÅTGÄRDAD',
+    'uppdaterad_tid': new Date()
+  });
+}
+
+/**
+ * Kompletterar dokumentmetadata via tillfällig PDF-till-Google-Docs-konvertering.
+ * Fulltext sparas inte i kalkylarket och den tillfälliga Google Docs-filen slängs efter extraktion.
+ */
+function enrichMetadataFromPdfTextBatch() {
+  assertDriveAdvancedServiceEnabled_();
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  const batchSize = getPositiveIntegerSetting_(settings.TEXT_EXTRACTION_BATCH_SIZE, 5);
+  const ocrLanguage = String(settings.TEXT_EXTRACTION_OCR_LANGUAGE || 'sv');
+  const documentSheet = spreadsheet.getSheetByName('Dokument');
+  const documentHeaderMap = getHeaderMap_(documentSheet);
+  const candidateRows = getDocumentsNeedingTextMetadata_(documentSheet, documentHeaderMap, batchSize);
+  const summary = { selected: candidateRows.length, processed: 0, updated: 0, manualReview: 0, errors: 0 };
+
+  candidateRows.forEach(function(candidate) {
+    try {
+      const result = enrichDocumentMetadataFromPdfText_(spreadsheet, candidate.rowNumber, candidate.values, ocrLanguage);
+      summary.processed += 1;
+      summary.updated += result.updated ? 1 : 0;
+      summary.manualReview += result.manualReviewCount || 0;
+    } catch (error) {
+      summary.errors += 1;
+      logError_('enrichMetadataFromPdfTextBatch', error, 'Dokument', candidate.values.drive_file_id || '');
+      addManualReviewItem_(spreadsheet, 'Dokument', candidate.values.drive_file_id || '', 'text_extraction_status', 'FEL', 'TEXTUTVINNING_FEL', error.message || String(error), 'LÅG');
+    }
+  });
+
+  logAnalysis_('INFO', 'enrichMetadataFromPdfTextBatch', 'Komplettering från PDF-text slutförd.', summary);
+  return summary;
+}
+
+function getDocumentsNeedingTextMetadata_(sheet, headerMap, limit) {
+  const rows = [];
+  if (sheet.getLastRow() < 2) {
+    return rows;
+  }
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let index = 0; index < values.length && rows.length < limit; index += 1) {
+    const rowNumber = index + 2;
+    const rowObject = rowToObject_(values[index], headerMap);
+    const hasDriveFileId = String(rowObject.drive_file_id || '').trim() !== '';
+    const missingCentralMetadata = String(rowObject.dnr_normaliserad || '').trim() === '' || String(rowObject.beslutsdatum || '').trim() === '';
+    const notAlreadyExtracted = normalizeSettingValue_(rowObject.text_extraction_status || '') !== 'TEMP_EXTRACTED_DELETED';
+    if (hasDriveFileId && missingCentralMetadata && notAlreadyExtracted) {
+      rows.push({ rowNumber: rowNumber, values: rowObject });
+    }
+  }
+  return rows;
+}
+
+function enrichDocumentMetadataFromPdfText_(spreadsheet, documentRow, documentValues, ocrLanguage) {
+  const documentSheet = spreadsheet.getSheetByName('Dokument');
+  const documentHeaderMap = getHeaderMap_(documentSheet);
+  const driveFileId = documentValues.drive_file_id;
+  const extracted = extractTemporaryTextFromPdf_(driveFileId, ocrLanguage);
+  const textMetadata = extractDocumentMetadataFromText_(extracted.text, documentValues.filnamn || '');
+  const fileNameMetadata = extractDocumentMetadataFromFileName_(documentValues.filnamn || '');
+  const metadata = mergeMetadata_(textMetadata, fileNameMetadata, documentValues);
+  const previousCaseId = String(documentValues.case_id || '');
+  const caseId = metadata.dnrNormaliserad ? buildCaseIdFromDnr_(metadata.dnrNormaliserad) : (previousCaseId || buildTemporaryCaseId_(driveFileId));
+  const confidence = metadata.dnrNormaliserad && metadata.beslutsdatum ? 'HÖG' : 'MEDEL';
+  const manualReviewNeeded = !metadata.dnrNormaliserad || !metadata.beslutsdatum;
+  let manualReviewCount = 0;
+
+  if (previousCaseId && previousCaseId !== caseId && previousCaseId.indexOf('TEMP_') === 0) {
+    migrateTemporaryCaseId_(spreadsheet, previousCaseId, caseId);
+  }
+
+  if (!isRowManuallyLocked_(documentSheet, documentRow, documentHeaderMap)) {
+    setRowValues_(documentSheet, documentRow, documentHeaderMap, {
+      'dnr_raw': metadata.dnrRaw || documentValues.dnr_raw || '',
+      'dnr_normaliserad': metadata.dnrNormaliserad || documentValues.dnr_normaliserad || '',
+      'case_id': caseId,
+      'beslutsdatum': metadata.beslutsdatum || documentValues.beslutsdatum || '',
+      'dokumenttyp': metadata.dokumenttyp || documentValues.dokumenttyp || 'OKÄND',
+      'text_extraction_method': extracted.method,
+      'text_extraction_status': 'TEMP_EXTRACTED_DELETED',
+      'text_length': extracted.textLength,
+      'analysis_status': 'TEXT_METADATA_REGISTRERAD',
+      'confidence': confidence,
+      'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+      'uppdaterad_tid': new Date()
+    });
+  }
+
+  upsertCaseFromDocumentMetadata_(spreadsheet, caseId, metadata, confidence, manualReviewNeeded);
+  upsertCaseDocumentLink_(spreadsheet, caseId, driveFileId, metadata, confidence, manualReviewNeeded);
+
+  if (metadata.dnrNormaliserad) {
+    closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'dnr_normaliserad', 'SAKNAT_DIARIENUMMER');
+  } else {
+    addManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'dnr_normaliserad', '', 'SAKNAT_DIARIENUMMER', 'Diarienummer kunde inte identifieras efter tillfällig PDF-textutvinning.', 'LÅG');
+    manualReviewCount += 1;
+  }
+
+  if (metadata.beslutsdatum) {
+    closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'beslutsdatum', 'SAKNAT_BESLUTSDATUM');
+  } else {
+    addManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'beslutsdatum', '', 'SAKNAT_BESLUTSDATUM', 'Beslutsdatum kunde inte identifieras efter tillfällig PDF-textutvinning.', 'LÅG');
+    manualReviewCount += 1;
+  }
+
+  return { updated: true, caseId: caseId, manualReviewCount: manualReviewCount };
+}
+
+function extractTemporaryTextFromPdf_(driveFileId, ocrLanguage) {
+  const sourceFile = DriveApp.getFileById(driveFileId);
+  const tempName = 'TEMP_TEXT_' + driveFileId + '_' + new Date().getTime();
+  let tempFileId = '';
+  try {
+    const inserted = Drive.Files.insert(
+      { title: tempName, mimeType: MimeType.GOOGLE_DOCS },
+      sourceFile.getBlob(),
+      { convert: true, ocr: true, ocrLanguage: ocrLanguage || 'sv' }
+    );
+    tempFileId = inserted.id;
+    const text = DocumentApp.openById(tempFileId).getBody().getText() || '';
+    return { method: 'GOOGLE_DOCS_OCR_TEMP', status: 'TEMP_EXTRACTED_DELETED', text: text, textLength: text.length };
+  } finally {
+    if (tempFileId) {
+      DriveApp.getFileById(tempFileId).setTrashed(true);
+    }
+  }
+}
+
+function extractDocumentMetadataFromText_(text, fallbackFileName) {
+  const safeText = String(text || '');
+  const dnrMatch = safeText.match(/(?:Dnr|Diarienr|Diarienummer)\s*[:.]?\s*([0-9]{4}[:\/][0-9]{1,6}|[0-9]{1,6}[:\/][0-9]{4})/i) ||
+    safeText.match(/\b([0-9]{4}[:\/][0-9]{1,6}|[0-9]{1,6}[:\/][0-9]{4})\b/);
+  const isoDateMatch = safeText.match(/\b(20[0-9]{2})[-.\/ ]([01]?[0-9])[-.\/ ]([0-3]?[0-9])\b/);
+  const swedishDateMatch = safeText.match(/\b([0-3]?[0-9])\s+(januari|februari|mars|april|maj|juni|juli|augusti|september|oktober|november|december)\s+(20[0-9]{2})\b/i);
+  return {
+    dnrRaw: dnrMatch ? dnrMatch[1] : '',
+    dnrNormaliserad: dnrMatch ? normalizeDnr_(dnrMatch[1]) : '',
+    beslutsdatum: normalizeDateMatch_(isoDateMatch, swedishDateMatch),
+    dokumenttyp: inferDocumentType_(safeText.substring(0, 2000) + ' ' + String(fallbackFileName || ''))
+  };
+}
+
+function normalizeDateMatch_(isoDateMatch, swedishDateMatch) {
+  if (isoDateMatch) {
+    return isoDateMatch[1] + '-' + padTwo_(isoDateMatch[2]) + '-' + padTwo_(isoDateMatch[3]);
+  }
+  if (swedishDateMatch) {
+    const months = {
+      januari: '01', februari: '02', mars: '03', april: '04', maj: '05', juni: '06',
+      juli: '07', augusti: '08', september: '09', oktober: '10', november: '11', december: '12'
+    };
+    return swedishDateMatch[3] + '-' + months[String(swedishDateMatch[2]).toLowerCase()] + '-' + padTwo_(swedishDateMatch[1]);
+  }
+  return '';
+}
+
+function padTwo_(value) {
+  return String(value || '').padStart(2, '0');
+}
+
+function mergeMetadata_(primary, secondary, existing) {
+  return {
+    dnrRaw: primary.dnrRaw || secondary.dnrRaw || existing.dnr_raw || '',
+    dnrNormaliserad: primary.dnrNormaliserad || secondary.dnrNormaliserad || existing.dnr_normaliserad || '',
+    beslutsdatum: primary.beslutsdatum || secondary.beslutsdatum || existing.beslutsdatum || '',
+    dokumenttyp: primary.dokumenttyp !== 'OKÄND' ? primary.dokumenttyp : (secondary.dokumenttyp || existing.dokumenttyp || 'OKÄND')
+  };
+}
+
+function assertDriveAdvancedServiceEnabled_() {
+  if (typeof Drive === 'undefined' || !Drive.Files || !Drive.Files.insert) {
+    throw new Error('Aktivera avancerade Google-tjänsten Drive API i Apps Script innan PDF-textutvinning körs.');
+  }
+}
+
+function migrateTemporaryCaseId_(spreadsheet, oldCaseId, newCaseId) {
+  updateCaseIdInSheet_(spreadsheet.getSheetByName('Ärenden'), oldCaseId, newCaseId);
+  updateCaseIdInSheet_(spreadsheet.getSheetByName('ÄrendeDokument'), oldCaseId, newCaseId);
+}
+
+function updateCaseIdInSheet_(sheet, oldCaseId, newCaseId) {
+  const headerMap = getHeaderMap_(sheet);
+  if (!headerMap.case_id || sheet.getLastRow() < 2) {
+    return;
+  }
+  const values = sheet.getRange(2, headerMap.case_id, sheet.getLastRow() - 1, 1).getValues();
+  values.forEach(function(row, index) {
+    if (String(row[0] || '') === String(oldCaseId)) {
+      sheet.getRange(index + 2, headerMap.case_id).setValue(newCaseId);
+    }
+  });
 }
 
 function updateDashboardDataPlaceholder() {

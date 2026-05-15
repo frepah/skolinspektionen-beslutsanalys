@@ -14,7 +14,10 @@ const requiredFunctions = [
   'addDriveFileToAnalysisQueue',
   'processAnalysisQueueBatch',
   'processQueuedDocument_',
-  'extractDocumentMetadataFromFileName_'
+  'extractDocumentMetadataFromFileName_',
+  'enrichMetadataFromPdfTextBatch',
+  'extractTemporaryTextFromPdf_',
+  'extractDocumentMetadataFromText_'
 ];
 
 for (const functionName of requiredFunctions) {
@@ -62,7 +65,12 @@ const requiredSourceSnippets = [
   'METADATA_REGISTRERAD',
   'SAKNAT_DIARIENUMMER',
   'ÄrendeDokument',
-  'rowToObject_'
+  'rowToObject_',
+  'Drive.Files.insert',
+  'DocumentApp.openById',
+  'TEXT_METADATA_REGISTRERAD',
+  'TEMP_EXTRACTED_DELETED',
+  'closeManualReviewItem_'
 ];
 
 for (const snippet of requiredSourceSnippets) {
