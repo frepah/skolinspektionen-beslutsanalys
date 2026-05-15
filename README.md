@@ -43,13 +43,34 @@ Den fjärde etappen kompletterar metadata från själva PDF-texten utan att spar
 - `Dokument`, `Ärenden` och `ÄrendeDokument` uppdateras när bättre metadata hittas.
 - Relevanta poster i `Manuell_granskning` markeras som `ÅTGÄRDAD` när metadata hittats.
 
+
+## Femte etappen
+
+Den femte etappen bygger första versionen av dashboardunderlaget:
+
+- `updateDashboardData()` bygger om fliken `DashboardData` från sparade råtabeller.
+- `Dashboard_Datakvalitet` byggs om med varningar för köfel, manuell granskning, saknat diarienummer, saknat beslutsdatum och risk för dubbelräkning.
+- Dashboardunderlaget räknar på lagrade tabeller, inte på PDF-filer.
+- `DashboardData` får raderas och byggas om; råtabellerna raderas inte.
+
+## Sjätte etappen
+
+Den sjätte etappen lägger till första regelbaserade extraktionen av beslutssignaler från PDF-text:
+
+- `extractDecisionSignalsFromPdfTextBatch()` läser dokument i små batchar via samma tillfälliga Google Docs-konvertering som metadataetappen.
+- Fulltext används bara i minnet och sparas inte permanent i kalkylarket.
+- Funktionen registrerar första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder` med stabila ID:n så att upprepade körningar uppdaterar i stället för att skapa dubbletter.
+- `Ärenden` uppdateras med sammanfattande signaler för föreläggande, vite, vitesbelopp, dokumentationskrav, allvarsindex och uppföljningsutfall.
+- Oklara dokument läggs i `Manuell_granskning` med problemtypen `BESLUTSSIGNALER_OKLARA` i stället för att systemet gissar.
+- Dashboardunderlaget räknar nu även bristområden, briststatus, lagrum, åtgärder och allvarsindex.
+
 ## Beslutade standarder
 
 Standardinställningarna följer kravspecifikationens prioritering: ingen kostnad, dataminimering, robusthet, dubblettskydd, manuell granskning och spårbarhet.
 
 Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI-/externa tjänster är avstängda i standardläge.
 
-## Kom igång med etapp 2–4
+## Kom igång med etapp 2–6
 
 1. Uppdatera Apps Script-filen `AnalysisWorkbook.gs` med repo-versionen.
 2. Uppdatera `appsscript.json` och aktivera avancerade Google-tjänsten Drive API v3 om du ska köra PDF-textkomplettering. Lägg inte till Drive API två gånger; finns Drive redan under Tjänster ska du inte klicka Lägg till igen.
@@ -61,3 +82,7 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 8. Kör **Analys → Bearbeta analyskö (metadata)** för att skapa första ärende- och dokumentkopplingarna.
 9. Kör **Analys → Komplettera metadata från PDF-text** för att försöka lösa saknade diarienummer och beslutsdatum.
 10. Kontrollera flikarna `Ärenden`, `ÄrendeDokument`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
+11. Kör **Analys → Extrahera beslutssignaler från PDF-text** för att fylla första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder`.
+12. Kontrollera flikarna `DokumentBrist`, `Lagrum`, `Åtgärder`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
+13. Kör **Analys → Uppdatera DashboardData** för att bygga dashboardunderlaget.
+14. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.

@@ -17,7 +17,13 @@ const requiredFunctions = [
   'extractDocumentMetadataFromFileName_',
   'enrichMetadataFromPdfTextBatch',
   'extractTemporaryTextFromPdf_',
-  'extractDocumentMetadataFromText_'
+  'extractDocumentMetadataFromText_',
+  'updateDashboardData',
+  'extractDecisionSignalsFromPdfTextBatch',
+  'extractDecisionSignalsFromText_',
+  'upsertDocumentBrist_',
+  'upsertLagrum_',
+  'upsertAction_'
 ];
 
 for (const functionName of requiredFunctions) {
@@ -71,7 +77,20 @@ const requiredSourceSnippets = [
   'DocumentApp.openById',
   'TEXT_METADATA_REGISTRERAD',
   'TEMP_EXTRACTED_DELETED',
-  'closeManualReviewItem_'
+  'closeManualReviewItem_',
+  'Dashboard_Datakvalitet',
+  'replaceSheetData_',
+  'dashboardRow_',
+  'RISK_DUBBELRÄKNING',
+  'DECISION_SIGNAL_BATCH_SIZE',
+  'BESLUTSSIGNALER_REGISTRERADE',
+  'BESLUTSSIGNALER_OKLARA',
+  'SAKNAR_BESLUTSSIGNALER',
+  'DokumentBrist',
+  'Lagrum',
+  'Åtgärder',
+  'SKOLLAGEN_',
+  'FÖRELÄGGANDE_MED_VITE'
 ];
 
 for (const snippet of requiredSourceSnippets) {

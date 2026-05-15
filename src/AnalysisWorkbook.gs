@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: '0.4.1',
+  version: '0.6.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -42,7 +42,8 @@ const ANALYSIS_SETTINGS_DEFAULTS = Object.freeze({
   QUEUE_DEFAULT_ACTION: 'ANALYSERA_NY',
   QUEUE_DEFAULT_PRIORITY: 'NORMAL',
   TEXT_EXTRACTION_BATCH_SIZE: '5',
-  TEXT_EXTRACTION_OCR_LANGUAGE: 'sv'
+  TEXT_EXTRACTION_OCR_LANGUAGE: 'sv',
+  DECISION_SIGNAL_BATCH_SIZE: '5'
 });
 
 const ANALYSIS_TABLES = Object.freeze({
@@ -268,7 +269,8 @@ const SETTING_DESCRIPTIONS = Object.freeze({
   QUEUE_DEFAULT_ACTION: 'Standardåtgärd när nya PDF:er läggs i analyskö.',
   QUEUE_DEFAULT_PRIORITY: 'Standardprioritet när nya PDF:er läggs i analyskö.',
   TEXT_EXTRACTION_BATCH_SIZE: 'Batchstorlek för tillfällig PDF-textutvinning. Hålls lägre än analysköbatch eftersom PDF-konvertering är långsammare.',
-  TEXT_EXTRACTION_OCR_LANGUAGE: 'OCR-språk vid tillfällig Google Docs-konvertering av PDF.'
+  TEXT_EXTRACTION_OCR_LANGUAGE: 'OCR-språk vid tillfällig Google Docs-konvertering av PDF.',
+  DECISION_SIGNAL_BATCH_SIZE: 'Batchstorlek för regelbaserad extraktion av brister, lagrum och åtgärder från tillfällig PDF-text.'
 });
 
 /** Skapar saknade flikar, rubriker, grundinställningar och kodböcker utan att radera befintlig data. */
@@ -346,8 +348,9 @@ function onOpen() {
     .addItem('Synka analyskö från Drive-mappar', 'syncAnalysisQueueFromDriveFolders')
     .addItem('Bearbeta analyskö (metadata)', 'processAnalysisQueueBatch')
     .addItem('Komplettera metadata från PDF-text', 'enrichMetadataFromPdfTextBatch')
+    .addItem('Extrahera beslutssignaler från PDF-text', 'extractDecisionSignalsFromPdfTextBatch')
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
-    .addItem('Uppdatera DashboardData (platshållare)', 'updateDashboardDataPlaceholder')
+    .addItem('Uppdatera DashboardData', 'updateDashboardData')
     .addToUi();
 }
 
@@ -360,9 +363,6 @@ function runAnalysisWorkbookSmokeTest() {
   return { status: hasErrors ? ANALYSIS_SYSTEM.status.error : ANALYSIS_SYSTEM.status.ok, message: message };
 }
 
-function syncAnalysisQueuePlaceholder() {
-  return syncAnalysisQueueFromDriveFolders();
-}
 
 /**
  * Synkar PDF-filer från Drive-mappar som anges i Inställningar_Analys/ANALYSIS_SOURCE_FOLDER_IDS.
@@ -915,8 +915,460 @@ function updateCaseIdInSheet_(sheet, oldCaseId, newCaseId) {
   });
 }
 
-function updateDashboardDataPlaceholder() {
-  logAnalysis_('INFO', 'updateDashboardDataPlaceholder', 'Platshållare körd. DashboardData-byggare implementeras i senare etapp.', {});
+/**
+ * Extraherar första regelbaserade beslutssignaler från PDF-text utan extern AI och utan permanent fulltextlagring.
+ * Signalerna är avsedda som dashboard- och granskningsunderlag, inte som slutlig juridisk klassificering.
+ */
+function extractDecisionSignalsFromPdfTextBatch() {
+  assertDriveAdvancedServiceEnabled_();
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  const batchSize = getPositiveIntegerSetting_(settings.DECISION_SIGNAL_BATCH_SIZE, 5);
+  const ocrLanguage = String(settings.TEXT_EXTRACTION_OCR_LANGUAGE || 'sv');
+  const documentSheet = spreadsheet.getSheetByName('Dokument');
+  const documentHeaderMap = getHeaderMap_(documentSheet);
+  const candidateRows = getDocumentsNeedingDecisionSignals_(documentSheet, documentHeaderMap, batchSize);
+  const summary = { selected: candidateRows.length, processed: 0, updated: 0, brister: 0, lagrum: 0, actions: 0, manualReview: 0, errors: 0 };
+
+  candidateRows.forEach(function(candidate) {
+    try {
+      const result = extractDecisionSignalsForDocument_(spreadsheet, candidate.rowNumber, candidate.values, ocrLanguage);
+      summary.processed += 1;
+      summary.updated += result.updated ? 1 : 0;
+      summary.brister += result.brister || 0;
+      summary.lagrum += result.lagrum || 0;
+      summary.actions += result.actions || 0;
+      summary.manualReview += result.manualReviewCount || 0;
+    } catch (error) {
+      summary.errors += 1;
+      logError_('extractDecisionSignalsFromPdfTextBatch', error, 'Dokument', candidate.values.drive_file_id || '');
+      addManualReviewItem_(spreadsheet, 'Dokument', candidate.values.drive_file_id || '', 'analysis_status', 'FEL', 'BESLUTSSIGNALER_FEL', error.message || String(error), 'LÅG');
+    }
+  });
+
+  logAnalysis_('INFO', 'extractDecisionSignalsFromPdfTextBatch', 'Regelbaserad extraktion av beslutssignaler slutförd.', summary);
+  return summary;
+}
+
+function getDocumentsNeedingDecisionSignals_(sheet, headerMap, limit) {
+  const rows = [];
+  if (sheet.getLastRow() < 2) {
+    return rows;
+  }
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let index = 0; index < values.length && rows.length < limit; index += 1) {
+    const rowNumber = index + 2;
+    const rowObject = rowToObject_(values[index], headerMap);
+    const hasDriveFileId = String(rowObject.drive_file_id || '').trim() !== '';
+    const hasCaseId = String(rowObject.case_id || '').trim() !== '';
+    const alreadyDone = normalizeSettingValue_(rowObject.analysis_status || '') === 'BESLUTSSIGNALER_REGISTRERADE';
+    if (hasDriveFileId && hasCaseId && !alreadyDone) {
+      rows.push({ rowNumber: rowNumber, values: rowObject });
+    }
+  }
+  return rows;
+}
+
+function extractDecisionSignalsForDocument_(spreadsheet, documentRow, documentValues, ocrLanguage) {
+  const driveFileId = documentValues.drive_file_id;
+  const caseId = documentValues.case_id || buildTemporaryCaseId_(driveFileId);
+  const extracted = extractTemporaryTextFromPdf_(driveFileId, ocrLanguage);
+  const signals = extractDecisionSignalsFromText_(extracted.text || '');
+  const confidence = decisionSignalConfidence_(signals);
+  const manualReviewNeeded = signals.bristområden.length === 0 && signals.åtgärder.length === 0 && signals.lagrum.length === 0;
+  let manualReviewCount = 0;
+
+  signals.bristområden.forEach(function(brist) {
+    upsertDocumentBrist_(spreadsheet, caseId, driveFileId, brist, signals, confidence, manualReviewNeeded);
+  });
+  signals.lagrum.forEach(function(lagrum) {
+    upsertLagrum_(spreadsheet, caseId, driveFileId, lagrum, confidence, manualReviewNeeded);
+  });
+  signals.åtgärder.forEach(function(action) {
+    upsertAction_(spreadsheet, caseId, driveFileId, action, signals, confidence, manualReviewNeeded);
+  });
+  updateCaseDecisionSignals_(spreadsheet, caseId, signals, confidence, manualReviewNeeded);
+
+  const documentSheet = spreadsheet.getSheetByName('Dokument');
+  const documentHeaderMap = getHeaderMap_(documentSheet);
+  if (!isRowManuallyLocked_(documentSheet, documentRow, documentHeaderMap)) {
+    setRowValues_(documentSheet, documentRow, documentHeaderMap, {
+      'text_extraction_method': extracted.method,
+      'text_extraction_status': 'TEMP_EXTRACTED_DELETED',
+      'text_length': extracted.textLength,
+      'analysis_status': 'BESLUTSSIGNALER_REGISTRERADE',
+      'confidence': confidence,
+      'manuell_granskning': manualReviewNeeded ? 'JA' : String(documentValues.manuell_granskning || 'NEJ'),
+      'uppdaterad_tid': new Date()
+    });
+  }
+
+  if (manualReviewNeeded) {
+    addManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'analysis_status', '', 'BESLUTSSIGNALER_OKLARA', 'Inga tydliga brister, lagrum eller åtgärder kunde identifieras regelbaserat från PDF-texten.', 'LÅG');
+    manualReviewCount += 1;
+  } else {
+    closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'analysis_status', 'BESLUTSSIGNALER_OKLARA');
+  }
+
+  return {
+    updated: true,
+    brister: signals.bristområden.length,
+    lagrum: signals.lagrum.length,
+    actions: signals.åtgärder.length,
+    manualReviewCount: manualReviewCount
+  };
+}
+
+function extractDecisionSignalsFromText_(text) {
+  const safeText = String(text || '');
+  const lowerText = safeText.toLowerCase();
+  const bristområden = detectBristområden_(lowerText);
+  const åtgärder = detectActions_(lowerText);
+  const lagrum = detectLagrum_(safeText);
+  const vite = /\b(vite|vitesföreläggande|föreläggande vid vite)\b/i.test(safeText);
+  const vitesbelopp = extractVitesbelopp_(safeText);
+  const dokumentationskrav = /\b(redovis(a|ning)|dokumentera|dokumentation|återrapportera)\b/i.test(safeText);
+  const uppföljningsutfall = inferFollowUpOutcome_(lowerText);
+  const allvarsindex = calculateSeverityIndex_(bristområden, åtgärder, vite, uppföljningsutfall);
+  return {
+    bristområden: bristområden,
+    lagrum: lagrum,
+    åtgärder: åtgärder,
+    föreläggande: åtgärder.some(function(action) { return action.kod.indexOf('FÖRELÄGGANDE') === 0; }) ? 'JA' : 'NEJ',
+    vite: vite ? 'JA' : 'NEJ',
+    vitesbelopp: vitesbelopp,
+    valuta: vitesbelopp ? 'SEK' : '',
+    dokumentationskrav: dokumentationskrav ? 'JA' : 'NEJ',
+    uppföljningsutfall: uppföljningsutfall,
+    allvarsindex: allvarsindex
+  };
+}
+
+function detectBristområden_(lowerText) {
+  const rules = [
+    { kod: 'TRYGGHET_STUDIERO', patterns: ['trygghet', 'studiero', 'ordningsregler'] },
+    { kod: 'SÄRSKILT_STÖD', patterns: ['särskilt stöd', 'utreda elevens behov av stöd', 'åtgärdsprogram'] },
+    { kod: 'EXTRA_ANPASSNINGAR', patterns: ['extra anpassning'] },
+    { kod: 'ELEVHÄLSA', patterns: ['elevhälsa', 'elevhälsan', 'skolläkare', 'skolsköterska'] },
+    { kod: 'KRÄNKANDE_BEHANDLING', patterns: ['kränkande behandling', 'trakasserier', 'diskriminering'] },
+    { kod: 'SYSTEMATISKT_KVALITETSARBETE', patterns: ['systematiskt kvalitetsarbete', 'kvalitetsarbete', 'följa upp resultaten'] },
+    { kod: 'BETYG_BEDÖMNING', patterns: ['betyg', 'bedömning', 'nationella prov'] },
+    { kod: 'SKOLPLIKT_FRÅNVARO', patterns: ['skolplikt', 'frånvaro', 'problematisk frånvaro'] }
+  ];
+  return rules.filter(function(rule) {
+    return rule.patterns.some(function(pattern) { return lowerText.indexOf(pattern) !== -1; });
+  }).map(function(rule) {
+    return { kod: rule.kod, status: lowerText.indexOf('brist') !== -1 ? 'KONSTATERAD_BRIST' : 'RISK_ELLER_INDIKATION' };
+  });
+}
+
+function detectActions_(lowerText) {
+  const actions = [];
+  if (lowerText.indexOf('föreläggande vid vite') !== -1 || lowerText.indexOf('vitesföreläggande') !== -1) {
+    actions.push({ kod: 'FÖRELÄGGANDE_MED_VITE' });
+  } else if (lowerText.indexOf('förelägg') !== -1) {
+    actions.push({ kod: 'FÖRELÄGGANDE' });
+  }
+  if (/redovis(a|ning)|återrapportera/.test(lowerText)) {
+    actions.push({ kod: 'REDOVISNINGSKRAV' });
+  }
+  if (lowerText.indexOf('dokumentera') !== -1 || lowerText.indexOf('dokumentation') !== -1) {
+    actions.push({ kod: 'DOKUMENTATIONSKRAV' });
+  }
+  if (lowerText.indexOf('ärendet avslutas') !== -1 || lowerText.indexOf('avslutar ärendet') !== -1) {
+    actions.push({ kod: 'ÄRENDET_AVSLUTAS' });
+  }
+  if (actions.length === 0 && lowerText.indexOf('brist') === -1) {
+    actions.push({ kod: 'INGEN_ÅTGÄRD' });
+  }
+  return uniqueObjectsByKey_(actions, 'kod');
+}
+
+function detectLagrum_(text) {
+  const lagrum = [];
+  const lawPattern = /(\d+)\s*kap\.\s*(\d+)\s*§\s*skollagen/gi;
+  let match = lawPattern.exec(text);
+  while (match) {
+    lagrum.push({ raw: match[0], normaliserad: 'SKOLLAGEN_' + match[1] + '_' + match[2], roll: 'RÄTTSLIG_REGLERING' });
+    match = lawPattern.exec(text);
+  }
+  return uniqueObjectsByKey_(lagrum, 'normaliserad');
+}
+
+function extractVitesbelopp_(text) {
+  const match = String(text || '').match(/(?:vite|vitesbelopp)(?:\s+om|\s+på)?\s+([0-9][0-9\s.]*)\s*(?:kronor|kr)/i);
+  if (!match) {
+    return '';
+  }
+  return String(match[1] || '').replace(/[^0-9]/g, '');
+}
+
+function inferFollowUpOutcome_(lowerText) {
+  if (lowerText.indexOf('bristen kvarstår') !== -1 || lowerText.indexOf('brister kvarstår') !== -1) {
+    return 'BRISTER_KVARSTÅR';
+  }
+  if (lowerText.indexOf('delvis avhjälpt') !== -1) {
+    return 'BRISTER_DELVIS_AVHJÄLPTA';
+  }
+  if (lowerText.indexOf('bristen är avhjälpt') !== -1 || lowerText.indexOf('brister är avhjälpta') !== -1) {
+    return 'BRISTER_AVHJÄLPTA';
+  }
+  if (lowerText.indexOf('ärendet avslutas') !== -1 || lowerText.indexOf('avslutar ärendet') !== -1) {
+    return 'ÄRENDET_AVSLUTAS';
+  }
+  return '';
+}
+
+function calculateSeverityIndex_(bristområden, actions, vite, uppföljningsutfall) {
+  if (vite) {
+    return 5;
+  }
+  if (uppföljningsutfall === 'BRISTER_KVARSTÅR') {
+    return 4;
+  }
+  if (actions.some(function(action) { return action.kod === 'FÖRELÄGGANDE'; }) && bristområden.length > 1) {
+    return 4;
+  }
+  if (actions.some(function(action) { return action.kod.indexOf('FÖRELÄGGANDE') === 0; })) {
+    return 3;
+  }
+  if (bristområden.length > 0) {
+    return 2;
+  }
+  return 0;
+}
+
+function decisionSignalConfidence_(signals) {
+  const signalCount = signals.bristområden.length + signals.åtgärder.length + signals.lagrum.length;
+  if (signalCount >= 3) {
+    return 'MEDEL';
+  }
+  if (signalCount > 0) {
+    return 'LÅG';
+  }
+  return 'OKÄND';
+}
+
+function upsertDocumentBrist_(spreadsheet, caseId, driveFileId, brist, signals, confidence, manualReviewNeeded) {
+  const sheet = spreadsheet.getSheetByName('DokumentBrist');
+  const headerMap = getHeaderMap_(sheet);
+  const bristId = buildStableId_('BRIST', caseId, driveFileId, brist.kod);
+  const values = {
+    'brist_id': bristId,
+    'case_id': caseId,
+    'drive_file_id': driveFileId,
+    'bristområde_kod': brist.kod,
+    'briststatus': brist.status,
+    'åtgärdstyp': firstActionCode_(signals),
+    'allvarsindex': signals.allvarsindex,
+    'confidence': confidence,
+    'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+    'manuellt_låst': 'NEJ',
+    'uppdaterad_tid': new Date()
+  };
+  upsertRowByKey_(sheet, headerMap, 'brist_id', bristId, values);
+}
+
+function upsertLagrum_(spreadsheet, caseId, driveFileId, lagrum, confidence, manualReviewNeeded) {
+  const sheet = spreadsheet.getSheetByName('Lagrum');
+  const headerMap = getHeaderMap_(sheet);
+  const lagrumId = buildStableId_('LAGRUM', caseId, driveFileId, lagrum.normaliserad);
+  const values = {
+    'lagrum_id': lagrumId,
+    'case_id': caseId,
+    'drive_file_id': driveFileId,
+    'lagrum_raw': lagrum.raw,
+    'lagrum_normaliserad': lagrum.normaliserad,
+    'lagrum_roll': lagrum.roll,
+    'confidence': confidence,
+    'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+    'manuellt_låst': 'NEJ',
+    'uppdaterad_tid': new Date()
+  };
+  upsertRowByKey_(sheet, headerMap, 'lagrum_id', lagrumId, values);
+}
+
+function upsertAction_(spreadsheet, caseId, driveFileId, action, signals, confidence, manualReviewNeeded) {
+  const sheet = spreadsheet.getSheetByName('Åtgärder');
+  const headerMap = getHeaderMap_(sheet);
+  const actionId = buildStableId_('ATGARD', caseId, driveFileId, action.kod);
+  const values = {
+    'åtgärd_id': actionId,
+    'case_id': caseId,
+    'drive_file_id': driveFileId,
+    'åtgärdstyp': action.kod,
+    'föreläggande': signals.föreläggande,
+    'vite': signals.vite,
+    'vitesbelopp': signals.vitesbelopp,
+    'valuta': signals.valuta,
+    'dokumentationskrav': signals.dokumentationskrav,
+    'allvarsindex': signals.allvarsindex,
+    'confidence': confidence,
+    'manuell_granskning': manualReviewNeeded ? 'JA' : 'NEJ',
+    'manuellt_låst': 'NEJ',
+    'uppdaterad_tid': new Date()
+  };
+  upsertRowByKey_(sheet, headerMap, 'åtgärd_id', actionId, values);
+}
+
+function updateCaseDecisionSignals_(spreadsheet, caseId, signals, confidence, manualReviewNeeded) {
+  const sheet = spreadsheet.getSheetByName('Ärenden');
+  const headerMap = getHeaderMap_(sheet);
+  const existingRow = findRowByKey_(sheet, 'case_id', caseId);
+  if (!existingRow || isRowManuallyLocked_(sheet, existingRow, headerMap)) {
+    return;
+  }
+  const existingValues = rowToObject_(sheet.getRange(existingRow, 1, 1, sheet.getLastColumn()).getValues()[0], headerMap);
+  setRowValues_(sheet, existingRow, headerMap, {
+    'föreläggande': signals.föreläggande,
+    'vite': signals.vite,
+    'vitesbelopp': signals.vitesbelopp,
+    'valuta': signals.valuta,
+    'dokumentationskrav': signals.dokumentationskrav,
+    'allvarsindex': signals.allvarsindex,
+    'uppföljningsutfall': signals.uppföljningsutfall,
+    'confidence': confidence,
+    'manuell_granskning': manualReviewNeeded ? 'JA' : String(existingValues.manuell_granskning || 'NEJ'),
+    'uppdaterad_tid': new Date()
+  });
+}
+
+function firstActionCode_(signals) {
+  return signals.åtgärder.length ? signals.åtgärder[0].kod : '';
+}
+
+function uniqueObjectsByKey_(items, keyName) {
+  const seen = {};
+  return items.filter(function(item) {
+    const key = String(item[keyName] || '');
+    if (!key || seen[key]) {
+      return false;
+    }
+    seen[key] = true;
+    return true;
+  });
+}
+
+function buildStableId_(prefix, caseId, driveFileId, suffix) {
+  return [prefix, caseId, driveFileId, suffix].join('_').replace(/[^A-Za-z0-9_]/g, '_').substring(0, 180);
+}
+
+function upsertRowByKey_(sheet, headerMap, keyHeader, keyValue, values) {
+  const existingRow = findRowByKey_(sheet, keyHeader, keyValue);
+  const rowValues = Object.assign({}, values);
+  if (!existingRow) {
+    rowValues['skapad_tid'] = new Date();
+    appendRows_(sheet, [buildRow_(headerMap, rowValues)]);
+    return;
+  }
+  if (!isRowManuallyLocked_(sheet, existingRow, headerMap)) {
+    setRowValues_(sheet, existingRow, headerMap, rowValues);
+  }
+}
+
+
+/** Bygger om DashboardData och Dashboard_Datakvalitet från sparade råtabeller. */
+function updateDashboardData() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const now = new Date();
+  const documents = readSheetObjects_(spreadsheet.getSheetByName('Dokument'));
+  const cases = readSheetObjects_(spreadsheet.getSheetByName('Ärenden'));
+  const queue = readSheetObjects_(spreadsheet.getSheetByName('Analyskö'));
+  const manualReview = readSheetObjects_(spreadsheet.getSheetByName('Manuell_granskning'));
+  const documentBrister = readSheetObjects_(spreadsheet.getSheetByName('DokumentBrist'));
+  const lagrum = readSheetObjects_(spreadsheet.getSheetByName('Lagrum'));
+  const actions = readSheetObjects_(spreadsheet.getSheetByName('Åtgärder'));
+  const dashboardRows = [];
+  const qualityRows = [];
+
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_dokument', documents.length, '', '', 'Alla dokument', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_ärenden', cases.length, '', '', 'Alla ärenden/case_id', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_köade', countWhere_(queue, function(row) { return normalizeSettingValue_(row.status) === 'KÖAD'; }), '', '', 'Köposter med status KÖAD', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_köfel', countWhere_(queue, function(row) { return normalizeSettingValue_(row.status) === 'FEL'; }), '', '', 'Köposter med status FEL', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'manuell_granskning_öppen', countWhere_(manualReview, function(row) { return normalizeSettingValue_(row.status) !== 'ÅTGÄRDAD'; }), '', '', 'Manuella granskningsposter som inte är åtgärdade', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'saknar_dnr', countWhere_(documents, function(row) { return String(row.dnr_normaliserad || '').trim() === ''; }), '', '', 'Dokument utan normaliserat diarienummer', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'saknar_beslutsdatum', countWhere_(documents, function(row) { return String(row.beslutsdatum || '').trim() === ''; }), '', '', 'Dokument utan beslutsdatum', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_bristkopplingar', documentBrister.length, '', '', 'Rader i DokumentBrist', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_lagrum', lagrum.length, '', '', 'Rader i Lagrum', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'antal_åtgärder', actions.length, '', '', 'Rader i Åtgärder', now));
+  dashboardRows.push(dashboardRow_('översikt', 'mått', 'senast_uppdaterad', now, '', '', 'DashboardData byggd från råtabeller', now));
+
+  appendGroupedDashboardRows_(dashboardRows, documents, 'dokument_status', 'analysis_status', now);
+  appendGroupedDashboardRows_(dashboardRows, documents, 'dokumenttyp', 'dokumenttyp', now);
+  appendGroupedDashboardRows_(dashboardRows, documents, 'confidence', 'confidence', now);
+  appendGroupedDashboardRows_(dashboardRows, cases, 'ärendetyp', 'ärendetyp', now);
+  appendGroupedDashboardRows_(dashboardRows, cases, 'ärende_confidence', 'confidence', now);
+  appendGroupedDashboardRows_(dashboardRows, documentBrister, 'bristområden', 'bristområde_kod', now);
+  appendGroupedDashboardRows_(dashboardRows, documentBrister, 'briststatus', 'briststatus', now);
+  appendGroupedDashboardRows_(dashboardRows, lagrum, 'lagrum', 'lagrum_normaliserad', now);
+  appendGroupedDashboardRows_(dashboardRows, actions, 'åtgärder', 'åtgärdstyp', now);
+  appendGroupedDashboardRows_(dashboardRows, cases, 'allvarsindex', 'allvarsindex', now);
+
+  addQualityWarningIf_(qualityRows, 'KÖ_FEL', 'HÖG', 'Det finns köposter med status FEL.', 'Analyskö', '', countWhere_(queue, function(row) { return normalizeSettingValue_(row.status) === 'FEL'; }), now);
+  addQualityWarningIf_(qualityRows, 'MANUELL_GRANSKNING', 'MEDEL', 'Det finns öppna manuella granskningsposter.', 'Manuell_granskning', '', countWhere_(manualReview, function(row) { return normalizeSettingValue_(row.status) !== 'ÅTGÄRDAD'; }), now);
+  addQualityWarningIf_(qualityRows, 'SAKNAR_DNR', 'MEDEL', 'Dokument saknar normaliserat diarienummer.', 'Dokument', 'dnr_normaliserad', countWhere_(documents, function(row) { return String(row.dnr_normaliserad || '').trim() === ''; }), now);
+  addQualityWarningIf_(qualityRows, 'SAKNAR_BESLUTSDATUM', 'MEDEL', 'Dokument saknar beslutsdatum.', 'Dokument', 'beslutsdatum', countWhere_(documents, function(row) { return String(row.beslutsdatum || '').trim() === ''; }), now);
+  addQualityWarningIf_(qualityRows, 'RISK_DUBBELRÄKNING', 'LÅG', 'Det finns fler dokument än ärenden; dashboardens standardvy bör använda ärendenivå.', 'Dokument', 'case_id', documents.length > cases.length ? documents.length - cases.length : 0, now);
+  addQualityWarningIf_(qualityRows, 'SAKNAR_BESLUTSSIGNALER', 'LÅG', 'Dokument har metadata men saknar registrerade beslutssignaler.', 'Dokument', 'analysis_status', countWhere_(documents, function(row) { return String(row.case_id || '').trim() !== '' && normalizeSettingValue_(row.analysis_status || '') !== 'BESLUTSSIGNALER_REGISTRERADE'; }), now);
+
+  replaceSheetData_(spreadsheet.getSheetByName('DashboardData'), dashboardRows);
+  replaceSheetData_(spreadsheet.getSheetByName('Dashboard_Datakvalitet'), qualityRows);
+
+  const summary = { dashboardRows: dashboardRows.length, qualityWarnings: qualityRows.length, documents: documents.length, cases: cases.length, brister: documentBrister.length, lagrum: lagrum.length, actions: actions.length };
+  logAnalysis_('INFO', 'updateDashboardData', 'DashboardData uppdaterad.', summary);
+  return summary;
+}
+
+function dashboardRow_(dataset, dimension, key, value, periodStart, periodEnd, filterDescription, updatedAt) {
+  return [dataset, dimension, key, value, periodStart || '', periodEnd || '', filterDescription || '', updatedAt, ANALYSIS_SETTINGS_DEFAULTS.DASHBOARD_VERSION];
+}
+
+function appendGroupedDashboardRows_(rows, records, dataset, fieldName, updatedAt) {
+  const counts = groupCounts_(records, fieldName);
+  Object.keys(counts).sort().forEach(function(key) {
+    rows.push(dashboardRow_(dataset, fieldName, key, counts[key], '', '', 'Grupp från ' + fieldName, updatedAt));
+  });
+}
+
+function groupCounts_(records, fieldName) {
+  return records.reduce(function(counts, row) {
+    const rawValue = row[fieldName];
+    const key = rawValue === null || typeof rawValue === 'undefined' || String(rawValue).trim() === '' ? 'OKÄND' : String(rawValue).trim();
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function countWhere_(records, predicate) {
+  return records.reduce(function(count, row) {
+    return predicate(row) ? count + 1 : count;
+  }, 0);
+}
+
+function addQualityWarningIf_(rows, warningType, level, description, tableName, key, count, createdAt) {
+  if (count <= 0) {
+    return;
+  }
+  rows.push([Utilities.getUuid(), warningType, level, description, tableName, key || '', count, createdAt, 'NEJ']);
+}
+
+function readSheetObjects_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) {
+    return [];
+  }
+  const headerMap = getHeaderMap_(sheet);
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues()
+    .map(function(row) { return rowToObject_(row, headerMap); })
+    .filter(function(row) {
+      return Object.keys(row).some(function(key) { return String(row[key] || '').trim() !== ''; });
+    });
+}
+
+function replaceSheetData_(sheet, rows) {
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
+  }
+  appendRows_(sheet, rows);
 }
 
 
