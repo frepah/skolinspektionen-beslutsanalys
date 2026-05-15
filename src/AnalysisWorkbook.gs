@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: '0.6.0',
+  version: 'v0.6.1',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -585,6 +585,10 @@ function buildTemporaryCaseId_(driveFileId) {
   return 'TEMP_' + String(driveFileId || '').replace(/[^A-Za-z0-9]/g, '_');
 }
 
+function isTemporaryCaseId_(caseId) {
+  return String(caseId || '').indexOf('TEMP_') === 0;
+}
+
 function upsertCaseFromDocumentMetadata_(spreadsheet, caseId, metadata, confidence, manualReviewNeeded) {
   const sheet = spreadsheet.getSheetByName('Ärenden');
   const headerMap = getHeaderMap_(sheet);
@@ -898,11 +902,24 @@ function assertDriveAdvancedServiceEnabled_() {
 }
 
 function migrateTemporaryCaseId_(spreadsheet, oldCaseId, newCaseId) {
-  updateCaseIdInSheet_(spreadsheet.getSheetByName('Ärenden'), oldCaseId, newCaseId);
-  updateCaseIdInSheet_(spreadsheet.getSheetByName('ÄrendeDokument'), oldCaseId, newCaseId);
+  [
+    'Dokument',
+    'Ärenden',
+    'ÄrendeDokument',
+    'DokumentBrist',
+    'Lagrum',
+    'Åtgärder',
+    'Uppföljningar',
+    'DokumentPerson'
+  ].forEach(function(sheetName) {
+    updateCaseIdInSheet_(spreadsheet.getSheetByName(sheetName), oldCaseId, newCaseId);
+  });
 }
 
 function updateCaseIdInSheet_(sheet, oldCaseId, newCaseId) {
+  if (!sheet) {
+    return;
+  }
   const headerMap = getHeaderMap_(sheet);
   if (!headerMap.case_id || sheet.getLastRow() < 2) {
     return;
@@ -960,9 +977,10 @@ function getDocumentsNeedingDecisionSignals_(sheet, headerMap, limit) {
     const rowNumber = index + 2;
     const rowObject = rowToObject_(values[index], headerMap);
     const hasDriveFileId = String(rowObject.drive_file_id || '').trim() !== '';
-    const hasCaseId = String(rowObject.case_id || '').trim() !== '';
+    const caseId = String(rowObject.case_id || '').trim();
+    const hasStableCaseId = caseId !== '' && !isTemporaryCaseId_(caseId);
     const alreadyDone = normalizeSettingValue_(rowObject.analysis_status || '') === 'BESLUTSSIGNALER_REGISTRERADE';
-    if (hasDriveFileId && hasCaseId && !alreadyDone) {
+    if (hasDriveFileId && hasStableCaseId && !alreadyDone) {
       rows.push({ rowNumber: rowNumber, values: rowObject });
     }
   }
@@ -1308,8 +1326,9 @@ function updateDashboardData() {
   addQualityWarningIf_(qualityRows, 'MANUELL_GRANSKNING', 'MEDEL', 'Det finns öppna manuella granskningsposter.', 'Manuell_granskning', '', countWhere_(manualReview, function(row) { return normalizeSettingValue_(row.status) !== 'ÅTGÄRDAD'; }), now);
   addQualityWarningIf_(qualityRows, 'SAKNAR_DNR', 'MEDEL', 'Dokument saknar normaliserat diarienummer.', 'Dokument', 'dnr_normaliserad', countWhere_(documents, function(row) { return String(row.dnr_normaliserad || '').trim() === ''; }), now);
   addQualityWarningIf_(qualityRows, 'SAKNAR_BESLUTSDATUM', 'MEDEL', 'Dokument saknar beslutsdatum.', 'Dokument', 'beslutsdatum', countWhere_(documents, function(row) { return String(row.beslutsdatum || '').trim() === ''; }), now);
+  addQualityWarningIf_(qualityRows, 'TEMP_CASE_ID', 'HÖG', 'Dokument har tillfälliga case_id och bör kompletteras med diarienummer innan beslutssignaler extraheras.', 'Dokument', 'case_id', countWhere_(documents, function(row) { return isTemporaryCaseId_(row.case_id); }), now);
   addQualityWarningIf_(qualityRows, 'RISK_DUBBELRÄKNING', 'LÅG', 'Det finns fler dokument än ärenden; dashboardens standardvy bör använda ärendenivå.', 'Dokument', 'case_id', documents.length > cases.length ? documents.length - cases.length : 0, now);
-  addQualityWarningIf_(qualityRows, 'SAKNAR_BESLUTSSIGNALER', 'LÅG', 'Dokument har metadata men saknar registrerade beslutssignaler.', 'Dokument', 'analysis_status', countWhere_(documents, function(row) { return String(row.case_id || '').trim() !== '' && normalizeSettingValue_(row.analysis_status || '') !== 'BESLUTSSIGNALER_REGISTRERADE'; }), now);
+  addQualityWarningIf_(qualityRows, 'SAKNAR_BESLUTSSIGNALER', 'LÅG', 'Dokument har stabilt case_id men saknar registrerade beslutssignaler.', 'Dokument', 'analysis_status', countWhere_(documents, function(row) { return String(row.case_id || '').trim() !== '' && !isTemporaryCaseId_(row.case_id) && normalizeSettingValue_(row.analysis_status || '') !== 'BESLUTSSIGNALER_REGISTRERADE'; }), now);
 
   replaceSheetData_(spreadsheet.getSheetByName('DashboardData'), dashboardRows);
   replaceSheetData_(spreadsheet.getSheetByName('Dashboard_Datakvalitet'), qualityRows);

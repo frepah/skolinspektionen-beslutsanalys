@@ -21,6 +21,7 @@ const requiredFunctions = [
   'updateDashboardData',
   'extractDecisionSignalsFromPdfTextBatch',
   'extractDecisionSignalsFromText_',
+  'isTemporaryCaseId_',
   'upsertDocumentBrist_',
   'upsertLagrum_',
   'upsertAction_'
@@ -86,6 +87,7 @@ const requiredSourceSnippets = [
   'BESLUTSSIGNALER_REGISTRERADE',
   'BESLUTSSIGNALER_OKLARA',
   'SAKNAR_BESLUTSSIGNALER',
+  'TEMP_CASE_ID',
   'DokumentBrist',
   'Lagrum',
   'Åtgärder',

@@ -62,7 +62,8 @@ Den sjätte etappen lägger till första regelbaserade extraktionen av beslutssi
 - Funktionen registrerar första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder` med stabila ID:n så att upprepade körningar uppdaterar i stället för att skapa dubbletter.
 - `Ärenden` uppdateras med sammanfattande signaler för föreläggande, vite, vitesbelopp, dokumentationskrav, allvarsindex och uppföljningsutfall.
 - Oklara dokument läggs i `Manuell_granskning` med problemtypen `BESLUTSSIGNALER_OKLARA` i stället för att systemet gissar.
-- Dashboardunderlaget räknar nu även bristområden, briststatus, lagrum, åtgärder och allvarsindex.
+- Dokument med tillfälliga `case_id` (`TEMP_...`) hoppas över i beslutssignalsteget tills diarienummer har hittats, så att brister, lagrum och åtgärder inte kopplas till instabila ärende-ID:n.
+- Dashboardunderlaget räknar nu även bristområden, briststatus, lagrum, åtgärder och allvarsindex samt varnar för tillfälliga case-ID:n.
 
 ## Beslutade standarder
 
@@ -82,7 +83,8 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 8. Kör **Analys → Bearbeta analyskö (metadata)** för att skapa första ärende- och dokumentkopplingarna.
 9. Kör **Analys → Komplettera metadata från PDF-text** för att försöka lösa saknade diarienummer och beslutsdatum.
 10. Kontrollera flikarna `Ärenden`, `ÄrendeDokument`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
-11. Kör **Analys → Extrahera beslutssignaler från PDF-text** för att fylla första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder`.
-12. Kontrollera flikarna `DokumentBrist`, `Lagrum`, `Åtgärder`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
-13. Kör **Analys → Uppdatera DashboardData** för att bygga dashboardunderlaget.
-14. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.
+11. Kontrollera `Dashboard_Datakvalitet`. Om varningen `TEMP_CASE_ID` finns ska du först försöka lösa metadata med **Analys → Komplettera metadata från PDF-text** och eventuell manuell granskning.
+12. Kör **Analys → Extrahera beslutssignaler från PDF-text** för dokument som har stabila case-ID:n och fyll första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder`.
+13. Kontrollera flikarna `DokumentBrist`, `Lagrum`, `Åtgärder`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
+14. Kör **Analys → Uppdatera DashboardData** för att bygga dashboardunderlaget.
+15. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.
