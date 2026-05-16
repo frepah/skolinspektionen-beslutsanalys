@@ -65,13 +65,23 @@ Den sjätte etappen lägger till första regelbaserade extraktionen av beslutssi
 - Dokument med tillfälliga `case_id` (`TEMP_...`) hoppas över i beslutssignalsteget tills diarienummer har hittats, så att brister, lagrum och åtgärder inte kopplas till instabila ärende-ID:n.
 - Dashboardunderlaget räknar nu även bristområden, briststatus, lagrum, åtgärder och allvarsindex samt varnar för tillfälliga case-ID:n.
 
+
+## Sjunde etappen
+
+Den sjunde etappen bygger en första läsbar dashboardvy ovanpå `DashboardData`:
+
+- `buildDashboardOverview()` bygger om fliken `Dashboard_Översikt` från `DashboardData` och `Dashboard_Datakvalitet`.
+- Översikten visar nyckelmått, toppgrupper för bristområden, åtgärder, allvarsindex, dokumenttyper och ärendetyper.
+- Om `Dashboard_Datakvalitet` innehåller varningar visas de även i översikten.
+- Råtabellerna raderas inte; bara den beräknade översiktsfliken byggs om.
+
 ## Beslutade standarder
 
 Standardinställningarna följer kravspecifikationens prioritering: ingen kostnad, dataminimering, robusthet, dubblettskydd, manuell granskning och spårbarhet.
 
 Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI-/externa tjänster är avstängda i standardläge.
 
-## Kom igång med etapp 2–6
+## Kom igång med etapp 2–7
 
 1. Uppdatera Apps Script-filen `AnalysisWorkbook.gs` med repo-versionen.
 2. Uppdatera `appsscript.json` och aktivera avancerade Google-tjänsten Drive API v3 om du ska köra PDF-textkomplettering. Lägg inte till Drive API två gånger; finns Drive redan under Tjänster ska du inte klicka Lägg till igen.
@@ -88,3 +98,5 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 13. Kontrollera flikarna `DokumentBrist`, `Lagrum`, `Åtgärder`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
 14. Kör **Analys → Uppdatera DashboardData** för att bygga dashboardunderlaget.
 15. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.
+16. Kör **Analys → Bygg dashboardöversikt** för att skapa en första läsbar dashboardflik.
+17. Kontrollera fliken `Dashboard_Översikt`.

@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: 'v0.6.2',
+  version: 'v0.7.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -37,7 +37,7 @@ const ANALYSIS_SETTINGS_DEFAULTS = Object.freeze({
   DASHBOARD_STALE_HOURS_WARNING: '24',
   ANALYSIS_MODEL_VERSION: '0.1.0',
   CODEBOOK_VERSION: '0.1.0',
-  DASHBOARD_VERSION: '0.1.0',
+  DASHBOARD_VERSION: 'v0.1.0',
   ANALYSIS_SOURCE_FOLDER_IDS: '',
   QUEUE_DEFAULT_ACTION: 'ANALYSERA_NY',
   QUEUE_DEFAULT_PRIORITY: 'NORMAL',
@@ -120,6 +120,9 @@ const ANALYSIS_TABLES = Object.freeze({
   'Dashboard_Datakvalitet': [
     'varning_id', 'varningstyp', 'nivå', 'beskrivning', 'berörd_tabell', 'berörd_nyckel',
     'antal_poster', 'skapad_tid', 'åtgärdad'
+  ],
+  'Dashboard_Översikt': [
+    'sektion', 'nyckel', 'värde', 'kommentar', 'senast_uppdaterad'
   ],
   'Analyskö': [
     'queue_id', 'drive_file_id', 'case_id', 'åtgärd', 'prioritet', 'status', 'försök', 'senaste_fel',
@@ -352,6 +355,7 @@ function onOpen() {
     .addItem('Extrahera beslutssignaler från PDF-text', 'extractDecisionSignalsFromPdfTextBatch')
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData', 'updateDashboardData')
+    .addItem('Bygg dashboardöversikt', 'buildDashboardOverview')
     .addToUi();
 }
 
@@ -1406,6 +1410,87 @@ function updateDashboardData() {
   const summary = { dashboardRows: dashboardRows.length, qualityWarnings: qualityRows.length, documents: documents.length, cases: cases.length, brister: documentBrister.length, lagrum: lagrum.length, actions: actions.length };
   logAnalysis_('INFO', 'updateDashboardData', 'DashboardData uppdaterad.', summary);
   return summary;
+}
+
+
+/** Bygger en läsbar dashboardöversikt från DashboardData och Dashboard_Datakvalitet. */
+function buildDashboardOverview() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const now = new Date();
+  const dashboardData = readSheetObjects_(spreadsheet.getSheetByName('DashboardData'));
+  const qualityWarnings = readSheetObjects_(spreadsheet.getSheetByName('Dashboard_Datakvalitet'));
+  const rows = [];
+
+  addOverviewRow_(rows, 'Status', 'Datakvalitet', qualityWarnings.length === 0 ? 'OK' : qualityWarnings.length + ' varningar', qualityWarnings.length === 0 ? 'Dashboard_Datakvalitet är tom.' : 'Se Dashboard_Datakvalitet för detaljer.', now);
+  addOverviewMetricRows_(rows, dashboardData, [
+    ['antal_dokument', 'Antal dokument'],
+    ['antal_ärenden', 'Antal ärenden'],
+    ['antal_bristkopplingar', 'Antal bristkopplingar'],
+    ['antal_lagrum', 'Antal lagrum'],
+    ['antal_åtgärder', 'Antal åtgärder'],
+    ['manuell_granskning_öppen', 'Öppen manuell granskning'],
+    ['antal_köade', 'Köade poster'],
+    ['antal_köfel', 'Köfel']
+  ], now);
+
+  appendOverviewRowsFromDataset_(rows, dashboardData, 'bristområden', 'Bristområden', 'Antal dokument-bristkopplingar per bristområde.', now, 10);
+  appendOverviewRowsFromDataset_(rows, dashboardData, 'åtgärder', 'Åtgärder', 'Antal registrerade åtgärdsrader per åtgärdstyp.', now, 10);
+  appendOverviewRowsFromDataset_(rows, dashboardData, 'allvarsindex', 'Allvarsindex', 'Antal ärenden per allvarsindex.', now, 10);
+  appendOverviewRowsFromDataset_(rows, dashboardData, 'dokumenttyp', 'Dokumenttyper', 'Antal dokument per dokumenttyp.', now, 10);
+  appendOverviewRowsFromDataset_(rows, dashboardData, 'ärendetyp', 'Ärendetyper', 'Antal ärenden per ärendetyp.', now, 10);
+
+  if (qualityWarnings.length > 0) {
+    qualityWarnings.forEach(function(warning) {
+      addOverviewRow_(rows, 'Datakvalitet', warning.varningstyp || 'OKÄND', warning.antal_poster || 0, warning.beskrivning || '', now);
+    });
+  }
+
+  const sheet = ensureSheet_(spreadsheet, 'Dashboard_Översikt');
+  ensureHeaders_(sheet, ANALYSIS_TABLES['Dashboard_Översikt']);
+  replaceSheetData_(sheet, rows);
+  formatDashboardOverview_(sheet);
+  const summary = { rows: rows.length, qualityWarnings: qualityWarnings.length };
+  logAnalysis_('INFO', 'buildDashboardOverview', 'Dashboardöversikt uppdaterad.', summary);
+  return summary;
+}
+
+function addOverviewMetricRows_(rows, dashboardData, metricDefinitions, updatedAt) {
+  metricDefinitions.forEach(function(definition) {
+    const key = definition[0];
+    const label = definition[1];
+    addOverviewRow_(rows, 'Översikt', label, dashboardValue_(dashboardData, 'översikt', 'mått', key), key, updatedAt);
+  });
+}
+
+function appendOverviewRowsFromDataset_(rows, dashboardData, dataset, section, comment, updatedAt, limit) {
+  const values = dashboardData
+    .filter(function(row) { return String(row.dataset || '') === dataset; })
+    .sort(function(a, b) { return Number(b['värde'] || 0) - Number(a['värde'] || 0); })
+    .slice(0, limit || 10);
+  if (values.length === 0) {
+    addOverviewRow_(rows, section, 'Inga data', 0, comment, updatedAt);
+    return;
+  }
+  values.forEach(function(row) {
+    addOverviewRow_(rows, section, row['nyckel'] || 'OKÄND', row['värde'] || 0, comment, updatedAt);
+  });
+}
+
+function dashboardValue_(dashboardData, dataset, dimension, key) {
+  const match = dashboardData.find(function(row) {
+    return String(row.dataset || '') === dataset && String(row.dimension || '') === dimension && String(row['nyckel'] || '') === key;
+  });
+  return match ? match['värde'] : 0;
+}
+
+function addOverviewRow_(rows, section, key, value, comment, updatedAt) {
+  rows.push([section, key, value, comment || '', updatedAt]);
+}
+
+function formatDashboardOverview_(sheet) {
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).setFontWeight('bold').setWrap(true);
+  sheet.autoResizeColumns(1, Math.max(sheet.getLastColumn(), 1));
 }
 
 function dashboardRow_(dataset, dimension, key, value, periodStart, periodEnd, filterDescription, updatedAt) {
