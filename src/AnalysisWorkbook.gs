@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: 'v0.6.1',
+  version: 'v0.6.2',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -348,6 +348,7 @@ function onOpen() {
     .addItem('Synka analyskö från Drive-mappar', 'syncAnalysisQueueFromDriveFolders')
     .addItem('Bearbeta analyskö (metadata)', 'processAnalysisQueueBatch')
     .addItem('Komplettera metadata från PDF-text', 'enrichMetadataFromPdfTextBatch')
+    .addItem('Stäm av manuell granskning', 'reconcileManualReviewItems')
     .addItem('Extrahera beslutssignaler från PDF-text', 'extractDecisionSignalsFromPdfTextBatch')
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData', 'updateDashboardData')
@@ -716,6 +717,72 @@ function closeManualReviewItem_(spreadsheet, sourceTable, sourceKey, fieldName, 
   });
 }
 
+/** Stänger manuella granskningsposter där underliggande dokumentrad nu visar att problemet är löst. */
+function reconcileManualReviewItems() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const reviewSheet = spreadsheet.getSheetByName('Manuell_granskning');
+  const reviewHeaderMap = getHeaderMap_(reviewSheet);
+  const documentSheet = spreadsheet.getSheetByName('Dokument');
+  const documentHeaderMap = getHeaderMap_(documentSheet);
+  const summary = { checked: 0, closed: 0, skipped: 0 };
+
+  if (reviewSheet.getLastRow() < 2) {
+    logAnalysis_('INFO', 'reconcileManualReviewItems', 'Inga manuella granskningsposter att stämma av.', summary);
+    return summary;
+  }
+
+  const reviewRows = reviewSheet.getRange(2, 1, reviewSheet.getLastRow() - 1, reviewSheet.getLastColumn()).getValues();
+  reviewRows.forEach(function(row, index) {
+    const rowNumber = index + 2;
+    const review = rowToObject_(row, reviewHeaderMap);
+    if (normalizeSettingValue_(review.status || '') === 'ÅTGÄRDAD') {
+      summary.skipped += 1;
+      return;
+    }
+    summary.checked += 1;
+    if (isManualReviewResolved_(documentSheet, documentHeaderMap, review)) {
+      setRowValues_(reviewSheet, rowNumber, reviewHeaderMap, {
+        'status': 'ÅTGÄRDAD',
+        'uppdaterad_tid': new Date()
+      });
+      summary.closed += 1;
+    }
+  });
+
+  logAnalysis_('INFO', 'reconcileManualReviewItems', 'Manuell granskning avstämd mot aktuella dokumentrader.', summary);
+  return summary;
+}
+
+function isManualReviewResolved_(documentSheet, documentHeaderMap, review) {
+  if (String(review['källa_tabell'] || '') !== 'Dokument') {
+    return false;
+  }
+  const driveFileId = String(review['källa_nyckel'] || '').trim();
+  if (!driveFileId) {
+    return false;
+  }
+  const documentRow = findRowByKey_(documentSheet, 'drive_file_id', driveFileId);
+  if (!documentRow) {
+    return false;
+  }
+  const document = rowToObject_(documentSheet.getRange(documentRow, 1, 1, documentSheet.getLastColumn()).getValues()[0], documentHeaderMap);
+  const problemType = String(review.problemtyp || '');
+
+  if (problemType === 'SAKNAT_DIARIENUMMER') {
+    return String(document.dnr_normaliserad || '').trim() !== '';
+  }
+  if (problemType === 'SAKNAT_BESLUTSDATUM') {
+    return String(document.beslutsdatum || '').trim() !== '';
+  }
+  if (problemType === 'TEXTUTVINNING_FEL') {
+    return normalizeSettingValue_(document.text_extraction_status || '') === 'TEMP_EXTRACTED_DELETED';
+  }
+  if (problemType === 'BESLUTSSIGNALER_OKLARA' || problemType === 'BESLUTSSIGNALER_FEL') {
+    return normalizeSettingValue_(document.analysis_status || '') === 'BESLUTSSIGNALER_REGISTRERADE';
+  }
+  return false;
+}
+
 /**
  * Kompletterar dokumentmetadata via tillfällig PDF-till-Google-Docs-konvertering.
  * Fulltext sparas inte i kalkylarket och den tillfälliga Google Docs-filen slängs efter extraktion.
@@ -804,6 +871,8 @@ function enrichDocumentMetadataFromPdfText_(spreadsheet, documentRow, documentVa
 
   upsertCaseFromDocumentMetadata_(spreadsheet, caseId, metadata, confidence, manualReviewNeeded);
   upsertCaseDocumentLink_(spreadsheet, caseId, driveFileId, metadata, confidence, manualReviewNeeded);
+
+  closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'text_extraction_status', 'TEXTUTVINNING_FEL');
 
   if (metadata.dnrNormaliserad) {
     closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'dnr_normaliserad', 'SAKNAT_DIARIENUMMER');
@@ -1026,6 +1095,7 @@ function extractDecisionSignalsForDocument_(spreadsheet, documentRow, documentVa
     manualReviewCount += 1;
   } else {
     closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'analysis_status', 'BESLUTSSIGNALER_OKLARA');
+    closeManualReviewItem_(spreadsheet, 'Dokument', driveFileId, 'analysis_status', 'BESLUTSSIGNALER_FEL');
   }
 
   return {
