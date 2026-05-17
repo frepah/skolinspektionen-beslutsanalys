@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: 'v0.8.0',
+  version: 'v0.10.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -126,13 +126,17 @@ const ANALYSIS_TABLES = Object.freeze({
   'Dashboard_Översikt': [
     'sektion', 'nyckel', 'värde', 'kommentar', 'senast_uppdaterad'
   ],
+  'Driftstatus_Analys': [
+    'område', 'status', 'nyckel', 'värde', 'kommentar', 'senast_uppdaterad'
+  ],
   'Analyskö': [
     'queue_id', 'drive_file_id', 'case_id', 'åtgärd', 'prioritet', 'status', 'försök', 'senaste_fel',
     'skapad_tid', 'uppdaterad_tid', 'klar_tid'
   ],
   'Manuell_granskning': [
-    'review_id', 'källa_tabell', 'källa_nyckel', 'fält', 'föreslaget_värde', 'problemtyp', 'beskrivning',
-    'confidence', 'status', 'ansvarig', 'skapad_tid', 'uppdaterad_tid'
+    'review_id', 'källa_tabell', 'källa_nyckel', 'fält', 'föreslaget_värde', 'korrigerat_värde',
+    'problemtyp', 'beskrivning', 'confidence', 'status', 'ansvarig', 'åtgärdskommentar',
+    'skapad_tid', 'uppdaterad_tid', 'åtgärdad_tid'
   ],
   'Analyslogg': [
     'timestamp', 'nivå', 'funktion', 'meddelande', 'detaljer', 'actor', 'version'
@@ -356,10 +360,12 @@ function onOpen() {
     .addItem('Bearbeta analyskö (metadata)', 'processAnalysisQueueBatch')
     .addItem('Komplettera metadata från PDF-text', 'enrichMetadataFromPdfTextBatch')
     .addItem('Stäm av manuell granskning', 'reconcileManualReviewItems')
+    .addItem('Tillämpa manuella korrigeringar', 'applyManualReviewCorrections')
     .addItem('Extrahera beslutssignaler från PDF-text', 'extractDecisionSignalsFromPdfTextBatch')
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData', 'updateDashboardData')
     .addItem('Bygg dashboardöversikt', 'buildDashboardOverview')
+    .addItem('Uppdatera driftstatus', 'updateAnalysisOperationsStatus')
     .addSeparator()
     .addItem('Kör analysflöde en batch', 'runAnalysisPipelineOnce')
     .addItem('Installera tidsstyrd analyskörning', 'installAnalysisPipelineTrigger')
@@ -793,6 +799,197 @@ function isManualReviewResolved_(documentSheet, documentHeaderMap, review) {
     return normalizeSettingValue_(document.analysis_status || '') === 'BESLUTSSIGNALER_REGISTRERADE';
   }
   return false;
+}
+
+
+/**
+ * Tillämpa manuella korrigeringar från fliken Manuell_granskning.
+ *
+ * Arbetsflöde för en granskare:
+ * 1. Fyll i korrigerat_värde på en öppen rad.
+ * 2. Sätt status till GODKÄND eller KORRIGERAD.
+ * 3. Kör menyvalet Analys > Tillämpa manuella korrigeringar.
+ *
+ * Funktionen skriver aldrig fulltext och respekterar manuellt_låst på källraden.
+ */
+function applyManualReviewCorrections() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const reviewSheet = spreadsheet.getSheetByName('Manuell_granskning');
+  const reviewHeaderMap = getHeaderMap_(reviewSheet);
+  const summary = { checked: 0, applied: 0, skipped: 0, errors: 0 };
+
+  if (reviewSheet.getLastRow() < 2) {
+    logAnalysis_('INFO', 'applyManualReviewCorrections', 'Inga manuella korrigeringar att tillämpa.', summary);
+    return summary;
+  }
+
+  const reviewRows = reviewSheet.getRange(2, 1, reviewSheet.getLastRow() - 1, reviewSheet.getLastColumn()).getValues();
+  reviewRows.forEach(function(row, index) {
+    const rowNumber = index + 2;
+    const review = rowToObject_(row, reviewHeaderMap);
+    const status = normalizeSettingValue_(review.status || '');
+    const correctedValue = getManualReviewCorrectionValue_(review);
+
+    if (status === 'ÅTGÄRDAD') {
+      summary.skipped += 1;
+      return;
+    }
+    if (['GODKÄND', 'KORRIGERAD', 'KLAR'].indexOf(status) === -1 || correctedValue === '') {
+      summary.skipped += 1;
+      return;
+    }
+
+    summary.checked += 1;
+    try {
+      const result = applySingleManualReviewCorrection_(spreadsheet, review, correctedValue);
+      if (result.applied) {
+        setRowValues_(reviewSheet, rowNumber, reviewHeaderMap, {
+          'status': 'ÅTGÄRDAD',
+          'åtgärdskommentar': result.message,
+          'uppdaterad_tid': new Date(),
+          'åtgärdad_tid': new Date()
+        });
+        summary.applied += 1;
+      } else {
+        setRowValues_(reviewSheet, rowNumber, reviewHeaderMap, {
+          'åtgärdskommentar': result.message,
+          'uppdaterad_tid': new Date()
+        });
+        summary.skipped += 1;
+      }
+    } catch (error) {
+      summary.errors += 1;
+      setRowValues_(reviewSheet, rowNumber, reviewHeaderMap, {
+        'status': 'FEL',
+        'åtgärdskommentar': error.message || String(error),
+        'uppdaterad_tid': new Date()
+      });
+      logError_('applyManualReviewCorrections', error, review['källa_tabell'] || '', review['källa_nyckel'] || '');
+    }
+  });
+
+  if (summary.applied > 0) {
+    reconcileManualReviewItems();
+    updateDashboardData();
+    buildDashboardOverview();
+    updateAnalysisOperationsStatus();
+  }
+
+  logAnalysis_('INFO', 'applyManualReviewCorrections', 'Manuella korrigeringar behandlade.', summary);
+  return summary;
+}
+
+function getManualReviewCorrectionValue_(review) {
+  const corrected = String(review['korrigerat_värde'] || '').trim();
+  if (corrected !== '') {
+    return corrected;
+  }
+  return String(review['föreslaget_värde'] || '').trim();
+}
+
+function applySingleManualReviewCorrection_(spreadsheet, review, correctedValue) {
+  const sourceTable = String(review['källa_tabell'] || '').trim();
+  const sourceKey = String(review['källa_nyckel'] || '').trim();
+  const fieldName = String(review['fält'] || '').trim();
+  if (!sourceTable || !sourceKey || !fieldName) {
+    return { applied: false, message: 'Källa, nyckel eller fält saknas på granskningsraden.' };
+  }
+  const sourceSheet = spreadsheet.getSheetByName(sourceTable);
+  if (!sourceSheet) {
+    return { applied: false, message: 'Källfliken saknas: ' + sourceTable };
+  }
+  const sourceHeaderMap = getHeaderMap_(sourceSheet);
+  if (!sourceHeaderMap[fieldName]) {
+    return { applied: false, message: 'Fältet finns inte i källfliken: ' + fieldName };
+  }
+  const sourceRow = findSourceRowForManualReview_(sourceSheet, sourceTable, sourceKey);
+  if (!sourceRow) {
+    return { applied: false, message: 'Källraden kunde inte hittas.' };
+  }
+  if (isRowManuallyLocked_(sourceSheet, sourceRow, sourceHeaderMap)) {
+    return { applied: false, message: 'Källraden är manuellt låst och ändrades inte.' };
+  }
+  const normalizedValue = normalizeManualCorrectionValue_(fieldName, correctedValue);
+  if (sourceTable === 'Dokument') {
+    return applyDocumentManualCorrection_(spreadsheet, sourceSheet, sourceHeaderMap, sourceRow, fieldName, normalizedValue);
+  }
+  setRowValues_(sourceSheet, sourceRow, sourceHeaderMap, buildGenericManualCorrectionValues_(fieldName, normalizedValue));
+  return { applied: true, message: 'Korrigeringen tillämpades på ' + sourceTable + '.' };
+}
+
+function findSourceRowForManualReview_(sourceSheet, sourceTable, sourceKey) {
+  const primaryKeyByTable = {
+    'Dokument': 'drive_file_id',
+    'Ärenden': 'case_id',
+    'Huvudmän': 'huvudman_id',
+    'Skolenheter': 'skolenhet_id',
+    'DokumentBrist': 'brist_id',
+    'Lagrum': 'lagrum_id',
+    'Åtgärder': 'åtgärd_id',
+    'Uppföljningar': 'uppföljning_id',
+    'Personer': 'person_id'
+  };
+  const primaryKey = primaryKeyByTable[sourceTable];
+  return primaryKey ? findRowByKey_(sourceSheet, primaryKey, sourceKey) : 0;
+}
+
+function normalizeManualCorrectionValue_(fieldName, value) {
+  if (fieldName === 'dnr_normaliserad') {
+    return normalizeDnr_(value);
+  }
+  if (fieldName === 'beslutsdatum' || fieldName === 'beslutsdatum_första' || fieldName === 'beslutsdatum_senaste') {
+    return normalizeManualDate_(value);
+  }
+  return value;
+}
+
+function normalizeManualDate_(value) {
+  const raw = String(value || '').trim();
+  const isoMatch = raw.match(/^(20[0-9]{2})[-.\/ ]([01]?[0-9])[-.\/ ]([0-3]?[0-9])$/);
+  if (isoMatch) {
+    return isoMatch[1] + '-' + padTwo_(isoMatch[2]) + '-' + padTwo_(isoMatch[3]);
+  }
+  const swedishMatch = raw.match(/^([0-3]?[0-9])\s+(januari|februari|mars|april|maj|juni|juli|augusti|september|oktober|november|december)\s+(20[0-9]{2})$/i);
+  return normalizeDateMatch_(null, swedishMatch) || raw;
+}
+
+function buildGenericManualCorrectionValues_(fieldName, normalizedValue) {
+  const values = {};
+  values[fieldName] = normalizedValue;
+  values['confidence'] = 'MANUELL';
+  values['manuell_granskning'] = 'NEJ';
+  values['uppdaterad_tid'] = new Date();
+  return values;
+}
+
+function applyDocumentManualCorrection_(spreadsheet, documentSheet, documentHeaderMap, documentRow, fieldName, normalizedValue) {
+  const document = rowToObject_(documentSheet.getRange(documentRow, 1, 1, documentSheet.getLastColumn()).getValues()[0], documentHeaderMap);
+  const previousCaseId = String(document.case_id || '');
+  const values = buildGenericManualCorrectionValues_(fieldName, normalizedValue);
+
+  if (fieldName === 'dnr_normaliserad') {
+    const newCaseId = buildCaseIdFromDnr_(normalizedValue);
+    values['dnr_raw'] = normalizedValue;
+    values['case_id'] = newCaseId;
+    if (previousCaseId && previousCaseId !== newCaseId && isTemporaryCaseId_(previousCaseId)) {
+      migrateTemporaryCaseId_(spreadsheet, previousCaseId, newCaseId);
+    }
+  }
+
+  setRowValues_(documentSheet, documentRow, documentHeaderMap, values);
+  const updatedDocument = Object.assign({}, document, values);
+  const metadata = {
+    dnrRaw: updatedDocument.dnr_raw || updatedDocument.dnr_normaliserad || '',
+    dnrNormaliserad: updatedDocument.dnr_normaliserad || '',
+    beslutsdatum: updatedDocument.beslutsdatum || '',
+    dokumenttyp: updatedDocument.dokumenttyp || 'OKÄND'
+  };
+  const caseId = updatedDocument.case_id || (metadata.dnrNormaliserad ? buildCaseIdFromDnr_(metadata.dnrNormaliserad) : '');
+  if (caseId) {
+    upsertCaseFromDocumentMetadata_(spreadsheet, caseId, metadata, 'MANUELL', false);
+    upsertCaseDocumentLink_(spreadsheet, caseId, updatedDocument.drive_file_id || '', metadata, 'MANUELL', false);
+  }
+  return { applied: true, message: 'Korrigeringen tillämpades på Dokument och relaterade ärendetabeller uppdaterades.' };
 }
 
 /**
@@ -1390,6 +1587,7 @@ function runAnalysisPipelineOnce() {
     summary.decisionSignals = extractDecisionSignalsFromPdfTextBatch();
     summary.dashboardData = updateDashboardData();
     summary.dashboardOverview = buildDashboardOverview();
+    summary.operationsStatus = updateAnalysisOperationsStatus();
     summary.durationMs = new Date().getTime() - startedAt.getTime();
     logAnalysis_('INFO', 'runAnalysisPipelineOnce', 'Analysflöde kördes en batch.', summary);
     return summary;
@@ -1485,6 +1683,81 @@ function updateDashboardData() {
   return summary;
 }
 
+
+
+/** Bygger en driftstatusflik för trigger, senaste körningar och felhistorik. */
+function updateAnalysisOperationsStatus() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const now = new Date();
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  const logs = readSheetObjects_(spreadsheet.getSheetByName('Analyslogg'));
+  const errors = readSheetObjects_(spreadsheet.getSheetByName('Fellogg'));
+  const qualityWarnings = readSheetObjects_(spreadsheet.getSheetByName('Dashboard_Datakvalitet'));
+  const dashboardData = readSheetObjects_(spreadsheet.getSheetByName('DashboardData'));
+  const pipelineTriggers = getAnalysisPipelineTriggers_();
+  const rows = [];
+  const latestPipelineRun = latestLogForFunction_(logs, 'runAnalysisPipelineOnce');
+  const latestDashboardRun = latestLogForFunction_(logs, 'updateDashboardData');
+  const latestError = latestRecordByTimestamp_(errors);
+  const latestDashboardUpdated = dashboardValue_(dashboardData, 'översikt', 'mått', 'senast_uppdaterad');
+
+  addStatusRow_(rows, 'Pipeline', latestPipelineRun ? 'OK' : 'VARNING', 'senaste_pipelinekörning', latestPipelineRun ? latestPipelineRun.timestamp : '', latestPipelineRun ? latestPipelineRun.meddelande : 'Ingen pipelinekörning hittades i Analyslogg.', now);
+  addStatusRow_(rows, 'Pipeline', pipelineTriggers.length > 0 ? 'OK' : 'INFO', 'aktiva_pipeline_triggers', pipelineTriggers.length, pipelineTriggers.length > 0 ? 'Tidsstyrd körning finns installerad.' : 'Ingen tidsstyrd körning är installerad.', now);
+  addStatusRow_(rows, 'Pipeline', normalizeSettingValue_(settings.PIPELINE_AUTO_RUN_ENABLED) === 'JA' ? 'OK' : 'INFO', 'automatisk_körning_aktiverad', settings.PIPELINE_AUTO_RUN_ENABLED || 'NEJ', 'Styrs av PIPELINE_AUTO_RUN_ENABLED.', now);
+  addStatusRow_(rows, 'Pipeline', 'INFO', 'pipeline_trigger_intervall_timmar', settings.PIPELINE_TRIGGER_EVERY_HOURS || '', 'Styrs av PIPELINE_TRIGGER_EVERY_HOURS.', now);
+  addStatusRow_(rows, 'Dashboard', qualityWarnings.length === 0 ? 'OK' : 'VARNING', 'datakvalitetsvarningar', qualityWarnings.length, qualityWarnings.length === 0 ? 'Dashboard_Datakvalitet är tom.' : 'Se Dashboard_Datakvalitet.', now);
+  addStatusRow_(rows, 'Dashboard', latestDashboardRun ? 'OK' : 'VARNING', 'senaste_dashboarddata_körning', latestDashboardRun ? latestDashboardRun.timestamp : '', latestDashboardRun ? latestDashboardRun.meddelande : 'Ingen updateDashboardData-körning hittades.', now);
+  addStatusRow_(rows, 'Dashboard', latestDashboardUpdated ? 'OK' : 'VARNING', 'dashboarddata_senast_uppdaterad', latestDashboardUpdated || '', latestDashboardUpdated ? 'Hämtat från DashboardData.' : 'Saknar senast_uppdaterad i DashboardData.', now);
+  addStatusRow_(rows, 'Fel', latestError ? 'INFO' : 'OK', 'senaste_fel_i_fellogg', latestError ? latestError.timestamp : '', latestError ? ('Historisk felrad finns: ' + (latestError.funktion || '') + ': ' + (latestError.meddelande || '')) : 'Inga felrader hittades i Fellogg.', now);
+
+  const sheet = ensureSheet_(spreadsheet, 'Driftstatus_Analys');
+  ensureHeaders_(sheet, ANALYSIS_TABLES['Driftstatus_Analys']);
+  replaceSheetData_(sheet, rows);
+  formatOperationsStatus_(sheet);
+  const summary = { rows: rows.length, triggers: pipelineTriggers.length, qualityWarnings: qualityWarnings.length, hasErrors: Boolean(latestError) };
+  logAnalysis_('INFO', 'updateAnalysisOperationsStatus', 'Driftstatus uppdaterad.', summary);
+  return summary;
+}
+
+function getAnalysisPipelineTriggers_() {
+  return ScriptApp.getProjectTriggers().filter(function(trigger) {
+    return trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runAnalysisPipelineOnce';
+  });
+}
+
+function latestLogForFunction_(logs, functionName) {
+  return latestRecordByTimestamp_(logs.filter(function(row) { return String(row.funktion || '') === functionName; }));
+}
+
+function latestRecordByTimestamp_(records) {
+  if (!records || records.length === 0) {
+    return null;
+  }
+  return records.reduce(function(latest, row) {
+    if (!latest) {
+      return row;
+    }
+    return toTimestamp_(row.timestamp) >= toTimestamp_(latest.timestamp) ? row : latest;
+  }, null);
+}
+
+function toTimestamp_(value) {
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function addStatusRow_(rows, area, status, key, value, comment, updatedAt) {
+  rows.push([area, status, key, value, comment || '', updatedAt]);
+}
+
+function formatOperationsStatus_(sheet) {
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).setFontWeight('bold').setWrap(true);
+  sheet.autoResizeColumns(1, Math.max(sheet.getLastColumn(), 1));
+}
 
 /** Bygger en läsbar dashboardöversikt från DashboardData och Dashboard_Datakvalitet. */
 function buildDashboardOverview() {

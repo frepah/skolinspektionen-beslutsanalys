@@ -86,13 +86,33 @@ Den åttonde etappen lägger till kontrollerad körning av hela analysflödet:
 - `removeAnalysisPipelineTriggers()` tar bort tidsstyrda körningar för analysflödet.
 - Automatisk körning är avstängd i standardläge.
 
+
+## Nionde etappen
+
+Den nionde etappen lägger till en enkel driftstatus för det automatiserade analysflödet:
+
+- `updateAnalysisOperationsStatus()` bygger om fliken `Driftstatus_Analys` med status för senaste pipelinekörning, aktiva triggers, datakvalitet, dashboarduppdatering och senaste felrad.
+- `runAnalysisPipelineOnce()` uppdaterar driftstatus efter att dashboardunderlaget och dashboardöversikten har byggts.
+- Driftstatusen är en kontrollvy och ändrar inte råtabellerna.
+
 ## Beslutade standarder
 
 Standardinställningarna följer kravspecifikationens prioritering: ingen kostnad, dataminimering, robusthet, dubblettskydd, manuell granskning och spårbarhet.
 
 Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI-/externa tjänster är avstängda i standardläge.
 
-## Kom igång med etapp 2–8
+## Tionde etappen
+
+Den tionde etappen gör den manuella granskningen mer användbar genom att låta en granskare tillämpa korrigeringar tillbaka till råtabellerna:
+
+- `Manuell_granskning` har nu kolumnerna `korrigerat_värde`, `åtgärdskommentar` och `åtgärdad_tid`.
+- `applyManualReviewCorrections()` läser öppna granskningsrader där granskaren har fyllt i `korrigerat_värde` och satt `status` till `GODKÄND`, `KORRIGERAD` eller `KLAR`.
+- Korrigeringar respekterar `manuellt_låst` på källraden och markerar granskningsraden som `ÅTGÄRDAD` först när källraden faktiskt har uppdaterats.
+- Korrigeringar av `dnr_normaliserad` och `beslutsdatum` i `Dokument` normaliseras och synkas vidare till `Ärenden` och `ÄrendeDokument`; tillfälliga `TEMP_`-ärenden migreras när diarienummer sätts manuellt.
+- Efter tillämpade korrigeringar byggs DashboardData, dashboardöversikt och driftstatus om så att kvalitetsvarningar speglar den manuella åtgärden.
+
+
+## Kom igång med etapp 2–10
 
 1. Uppdatera Apps Script-filen `AnalysisWorkbook.gs` med repo-versionen.
 2. Uppdatera `appsscript.json` och aktivera avancerade Google-tjänsten Drive API v3 om du ska köra PDF-textkomplettering. Lägg inte till Drive API två gånger; finns Drive redan under Tjänster ska du inte klicka Lägg till igen.
@@ -104,12 +124,14 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 8. Kör **Analys → Bearbeta analyskö (metadata)** för att skapa första ärende- och dokumentkopplingarna.
 9. Kör **Analys → Komplettera metadata från PDF-text** för att försöka lösa saknade diarienummer och beslutsdatum.
 10. Kontrollera flikarna `Ärenden`, `ÄrendeDokument`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
-11. Kontrollera `Dashboard_Datakvalitet`. Om varningen `TEMP_CASE_ID` finns ska du först försöka lösa metadata med **Analys → Komplettera metadata från PDF-text** och eventuell manuell granskning.
-12. Kör **Analys → Extrahera beslutssignaler från PDF-text** för dokument som har stabila case-ID:n och fyll första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder`.
-13. Kontrollera flikarna `DokumentBrist`, `Lagrum`, `Åtgärder`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
-14. Kör **Analys → Uppdatera DashboardData** för att bygga dashboardunderlaget.
-15. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.
-16. Kör **Analys → Bygg dashboardöversikt** för att skapa en första läsbar dashboardflik.
-17. Kontrollera fliken `Dashboard_Översikt`.
-18. Kör **Analys → Kör analysflöde en batch** när du vill testa hela kedjan i en kontrollerad batch.
-19. Aktivera tidsstyrd körning först när manuell batchkörning fungerar stabilt och `PIPELINE_AUTO_RUN_ENABLED` medvetet satts till `JA`.
+11. Om `Manuell_granskning` innehåller poster som behöver rättas: fyll i `korrigerat_värde`, sätt `status` till `KORRIGERAD` eller `GODKÄND`, och kör **Analys → Tillämpa manuella korrigeringar**.
+12. Kontrollera `Dashboard_Datakvalitet`. Om varningen `TEMP_CASE_ID` finns ska du först försöka lösa metadata med **Analys → Komplettera metadata från PDF-text** och eventuell manuell granskning.
+13. Kör **Analys → Extrahera beslutssignaler från PDF-text** för dokument som har stabila case-ID:n och fyll första versionen av `DokumentBrist`, `Lagrum` och `Åtgärder`.
+14. Kontrollera flikarna `DokumentBrist`, `Lagrum`, `Åtgärder`, `Manuell_granskning`, `Analyslogg` och `Fellogg`.
+15. Kör **Analys → Uppdatera DashboardData** för att bygga dashboardunderlaget.
+16. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.
+17. Kör **Analys → Bygg dashboardöversikt** för att skapa en första läsbar dashboardflik.
+18. Kontrollera fliken `Dashboard_Översikt`.
+19. Kör **Analys → Kör analysflöde en batch** när du vill testa hela kedjan i en kontrollerad batch.
+20. Kör **Analys → Uppdatera driftstatus** för att kontrollera pipeline, trigger, datakvalitet och senaste fel.
+21. Aktivera tidsstyrd körning först när manuell batchkörning fungerar stabilt och `PIPELINE_AUTO_RUN_ENABLED` medvetet satts till `JA`.
