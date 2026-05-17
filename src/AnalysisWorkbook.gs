@@ -7,7 +7,7 @@
  */
 
 const ANALYSIS_SYSTEM = Object.freeze({
-  version: 'v0.7.0',
+  version: 'v0.8.0',
   workbookName: 'Skolinspektionen analysdatabas',
   logActor: 'analysis-workbook',
   manualLockHeader: 'manuellt_låst',
@@ -43,7 +43,9 @@ const ANALYSIS_SETTINGS_DEFAULTS = Object.freeze({
   QUEUE_DEFAULT_PRIORITY: 'NORMAL',
   TEXT_EXTRACTION_BATCH_SIZE: '5',
   TEXT_EXTRACTION_OCR_LANGUAGE: 'sv',
-  DECISION_SIGNAL_BATCH_SIZE: '5'
+  DECISION_SIGNAL_BATCH_SIZE: '5',
+  PIPELINE_TRIGGER_EVERY_HOURS: '6',
+  PIPELINE_AUTO_RUN_ENABLED: 'NEJ'
 });
 
 const ANALYSIS_TABLES = Object.freeze({
@@ -273,7 +275,9 @@ const SETTING_DESCRIPTIONS = Object.freeze({
   QUEUE_DEFAULT_PRIORITY: 'Standardprioritet när nya PDF:er läggs i analyskö.',
   TEXT_EXTRACTION_BATCH_SIZE: 'Batchstorlek för tillfällig PDF-textutvinning. Hålls lägre än analysköbatch eftersom PDF-konvertering är långsammare.',
   TEXT_EXTRACTION_OCR_LANGUAGE: 'OCR-språk vid tillfällig Google Docs-konvertering av PDF.',
-  DECISION_SIGNAL_BATCH_SIZE: 'Batchstorlek för regelbaserad extraktion av brister, lagrum och åtgärder från tillfällig PDF-text.'
+  DECISION_SIGNAL_BATCH_SIZE: 'Batchstorlek för regelbaserad extraktion av brister, lagrum och åtgärder från tillfällig PDF-text.',
+  PIPELINE_TRIGGER_EVERY_HOURS: 'Intervall i timmar för tidsstyrd pipeline-trigger när automatisk körning aktiveras.',
+  PIPELINE_AUTO_RUN_ENABLED: 'Säkerhetsspärr för automatisk pipeline. Standard är NEJ.'
 });
 
 /** Skapar saknade flikar, rubriker, grundinställningar och kodböcker utan att radera befintlig data. */
@@ -356,6 +360,10 @@ function onOpen() {
     .addItem('Lägg till en PDF via fil-ID/URL', 'showAddDriveFileToAnalysisQueuePrompt')
     .addItem('Uppdatera DashboardData', 'updateDashboardData')
     .addItem('Bygg dashboardöversikt', 'buildDashboardOverview')
+    .addSeparator()
+    .addItem('Kör analysflöde en batch', 'runAnalysisPipelineOnce')
+    .addItem('Installera tidsstyrd analyskörning', 'installAnalysisPipelineTrigger')
+    .addItem('Ta bort tidsstyrd analyskörning', 'removeAnalysisPipelineTriggers')
     .addToUi();
 }
 
@@ -1358,6 +1366,71 @@ function upsertRowByKey_(sheet, headerMap, keyHeader, keyValue, values) {
   }
 }
 
+
+
+/** Kör hela analysflödet en kontrollerad batch och bygger om dashboardunderlaget. */
+function runAnalysisPipelineOnce() {
+  const startedAt = new Date();
+  const summary = {
+    sync: null,
+    queue: null,
+    textMetadata: null,
+    manualReview: null,
+    decisionSignals: null,
+    dashboardData: null,
+    dashboardOverview: null,
+    errors: 0
+  };
+
+  try {
+    summary.sync = syncAnalysisQueueFromDriveFolders();
+    summary.queue = processAnalysisQueueBatch();
+    summary.textMetadata = enrichMetadataFromPdfTextBatch();
+    summary.manualReview = reconcileManualReviewItems();
+    summary.decisionSignals = extractDecisionSignalsFromPdfTextBatch();
+    summary.dashboardData = updateDashboardData();
+    summary.dashboardOverview = buildDashboardOverview();
+    summary.durationMs = new Date().getTime() - startedAt.getTime();
+    logAnalysis_('INFO', 'runAnalysisPipelineOnce', 'Analysflöde kördes en batch.', summary);
+    return summary;
+  } catch (error) {
+    summary.errors += 1;
+    summary.durationMs = new Date().getTime() - startedAt.getTime();
+    logError_('runAnalysisPipelineOnce', error, 'Pipeline', 'runAnalysisPipelineOnce');
+    logAnalysis_('ERROR', 'runAnalysisPipelineOnce', 'Analysflöde avbröts med fel.', summary);
+    throw error;
+  }
+}
+
+/** Installerar en tidsstyrd trigger för analysflödet efter uttrycklig aktivering i inställningarna. */
+function installAnalysisPipelineTrigger() {
+  const spreadsheet = getActiveAnalysisSpreadsheet_();
+  const settings = readSettings_(spreadsheet.getSheetByName('Inställningar_Analys'));
+  if (normalizeSettingValue_(settings.PIPELINE_AUTO_RUN_ENABLED) !== 'JA') {
+    throw new Error('Sätt PIPELINE_AUTO_RUN_ENABLED till JA i Inställningar_Analys innan tidsstyrd analyskörning installeras. Standard är NEJ av säkerhetsskäl.');
+  }
+  const hours = getPositiveIntegerSetting_(settings.PIPELINE_TRIGGER_EVERY_HOURS, 6);
+  removeAnalysisPipelineTriggers();
+  ScriptApp.newTrigger('runAnalysisPipelineOnce').timeBased().everyHours(hours).create();
+  const summary = { everyHours: hours, functionName: 'runAnalysisPipelineOnce' };
+  logAnalysis_('INFO', 'installAnalysisPipelineTrigger', 'Tidsstyrd analyskörning installerad.', summary);
+  return summary;
+}
+
+/** Tar bort tidsstyrda triggers som kör analysflödet. */
+function removeAnalysisPipelineTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let removed = 0;
+  triggers.forEach(function(trigger) {
+    if (trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runAnalysisPipelineOnce') {
+      ScriptApp.deleteTrigger(trigger);
+      removed += 1;
+    }
+  });
+  const summary = { removed: removed };
+  logAnalysis_('INFO', 'removeAnalysisPipelineTriggers', 'Tidsstyrda analyskörningar borttagna.', summary);
+  return summary;
+}
 
 /** Bygger om DashboardData och Dashboard_Datakvalitet från sparade råtabeller. */
 function updateDashboardData() {

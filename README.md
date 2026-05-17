@@ -75,13 +75,24 @@ Den sjunde etappen bygger en första läsbar dashboardvy ovanpå `DashboardData`
 - Om `Dashboard_Datakvalitet` innehåller varningar visas de även i översikten.
 - Råtabellerna raderas inte; bara den beräknade översiktsfliken byggs om.
 
+
+## Åttonde etappen
+
+Den åttonde etappen lägger till kontrollerad körning av hela analysflödet:
+
+- `runAnalysisPipelineOnce()` kör en batch av synk, köbearbetning, PDF-textkomplettering, manuell avstämning, beslutssignaler, DashboardData och Dashboard_Översikt.
+- Körningen använder befintliga batchstorlekar och är därför avsedd att köras upprepade gånger, inte att bearbeta obegränsat många dokument i en enda Apps Script-körning.
+- `installAnalysisPipelineTrigger()` kan installera en tidsstyrd trigger, men bara om `PIPELINE_AUTO_RUN_ENABLED` först sätts till `JA` i `Inställningar_Analys`.
+- `removeAnalysisPipelineTriggers()` tar bort tidsstyrda körningar för analysflödet.
+- Automatisk körning är avstängd i standardläge.
+
 ## Beslutade standarder
 
 Standardinställningarna följer kravspecifikationens prioritering: ingen kostnad, dataminimering, robusthet, dubblettskydd, manuell granskning och spårbarhet.
 
 Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI-/externa tjänster är avstängda i standardläge.
 
-## Kom igång med etapp 2–7
+## Kom igång med etapp 2–8
 
 1. Uppdatera Apps Script-filen `AnalysisWorkbook.gs` med repo-versionen.
 2. Uppdatera `appsscript.json` och aktivera avancerade Google-tjänsten Drive API v3 om du ska köra PDF-textkomplettering. Lägg inte till Drive API två gånger; finns Drive redan under Tjänster ska du inte klicka Lägg till igen.
@@ -100,3 +111,5 @@ Fulltext och prompter loggas inte, fulltext lagras inte permanent och betalda AI
 15. Kontrollera flikarna `DashboardData` och `Dashboard_Datakvalitet`.
 16. Kör **Analys → Bygg dashboardöversikt** för att skapa en första läsbar dashboardflik.
 17. Kontrollera fliken `Dashboard_Översikt`.
+18. Kör **Analys → Kör analysflöde en batch** när du vill testa hela kedjan i en kontrollerad batch.
+19. Aktivera tidsstyrd körning först när manuell batchkörning fungerar stabilt och `PIPELINE_AUTO_RUN_ENABLED` medvetet satts till `JA`.
