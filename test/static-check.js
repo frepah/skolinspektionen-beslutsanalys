@@ -4,6 +4,22 @@ const path = require('path');
 const sourcePath = path.join(__dirname, '..', 'src', 'AnalysisWorkbook.gs');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
+for (const requiredDoc of ['README.md', 'AGENTS.md', 'CHANGELOG.md']) {
+  if (!fs.existsSync(path.join(__dirname, '..', requiredDoc))) {
+    throw new Error(`Missing required documentation file: ${requiredDoc}`);
+  }
+}
+
+const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+if (!readme.includes('Beslut om filstruktur') || !readme.includes('behåll `AnalysisWorkbook.gs`')) {
+  throw new Error('README must document the decision to keep the working monolithic AnalysisWorkbook.gs for now.');
+}
+
+
+if (!source.includes("version: 'v0.11.0'")) {
+  throw new Error('AnalysisWorkbook version must be v0.11.0 for this stage.');
+}
+
 const requiredFunctions = [
   'setupAnalysisWorkbook',
   'validateAnalysisWorkbook',
@@ -19,23 +35,21 @@ const requiredFunctions = [
   'extractTemporaryTextFromPdf_',
   'extractDocumentMetadataFromText_',
   'reconcileManualReviewItems',
-  'applyManualReviewCorrections',
-  'applySingleManualReviewCorrection_',
-  'applyDocumentManualCorrection_',
-  'normalizeManualDate_',
   'isManualReviewResolved_',
   'updateDashboardData',
   'buildDashboardOverview',
   'runAnalysisPipelineOnce',
   'installAnalysisPipelineTrigger',
   'removeAnalysisPipelineTriggers',
-  'updateAnalysisOperationsStatus',
-  'latestLogForFunction_',
-  'getAnalysisPipelineTriggers_',
   'appendOverviewRowsFromDataset_',
   'dashboardValue_',
   'extractDecisionSignalsFromPdfTextBatch',
   'extractDecisionSignalsFromText_',
+  'extractEntitiesFromPdfTextBatch',
+  'extractEntitiesFromText_',
+  'upsertHuvudman_',
+  'upsertSkolenhet_',
+  'updateCaseEntities_',
   'isTemporaryCaseId_',
   'upsertDocumentBrist_',
   'upsertLagrum_',
@@ -95,13 +109,8 @@ const requiredSourceSnippets = [
   'TEMP_EXTRACTED_DELETED',
   'TEXTUTVINNING_FEL',
   'closeManualReviewItem_',
-  'korrigerat_värde',
-  'åtgärdskommentar',
-  'Tillämpa manuella korrigeringar',
   'Dashboard_Datakvalitet',
   'Dashboard_Översikt',
-  'Driftstatus_Analys',
-  'updateAnalysisOperationsStatus',
   'buildDashboardOverview',
   'replaceSheetData_',
   'dashboardRow_',
@@ -118,7 +127,13 @@ const requiredSourceSnippets = [
   'Lagrum',
   'Åtgärder',
   'SKOLLAGEN_',
-  'FÖRELÄGGANDE_MED_VITE'
+  'FÖRELÄGGANDE_MED_VITE',
+  'ENTITY_EXTRACTION_BATCH_SIZE',
+  'ENHETER_REGISTRERADE',
+  'SAKNAR_HUVUDMAN',
+  'Extrahera huvudmän och skolenheter från PDF-text',
+  'antal_huvudmän',
+  'antal_skolenheter'
 ];
 
 for (const snippet of requiredSourceSnippets) {
